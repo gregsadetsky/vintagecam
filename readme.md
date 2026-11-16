@@ -68,6 +68,10 @@ bridge / sensor register, or write an extra one, for experiments).
 | --- | --- | --- | --- |
 | creative vf0250 | 041e:4051 | zc3xx bridge + gc0303 sensor | works, mjpeg, 640x480 ~14 fps and 320x240 ~28 fps |
 | logitech quickcam express | 046d:0840 | stv0600 bridge + pb0100 sensor | works, raw bayer, 320x240 ~10 fps and 352x288 ~8 fps. units with an hdcs sensor: not ported |
+| lego camera (quickcam web) | 046d:0850 | stv0610 bridge + vv6410 sensor | works, raw bayer, 356x292 ~8.5 fps |
+| creative webcam nx (pd1110) | 041e:401c | zc3xx bridge + pas106 sensor | works, mjpeg, 352x288 ~9 to 20 fps depending on the scene. 176x144 written, not run |
+| ibm pc camera | 0545:8080, device version 3.0a | xirlink cit, model 2 | works, raw bayer, 320x240 ~7.5 fps and 352x288 ~4.6 fps. 176x144 and other models: not ported |
+| sony eyetoy | 054c:0154 | ov519 | not working: this unit's usb config descriptor reads back as 0xff after byte 20, so macos never sees the video endpoint. cause unexplained |
 
 ## adding a camera
 
@@ -98,6 +102,16 @@ frame headers against what the kernel source says.
 - macos leaves these devices unconfigured, so the engine sets configuration 1
   before claiming the interface.
 - `gspca/` holds headers and tables copied from the linux kernel, hence gpl.
+- four cameras at once (quickcam, lego, nx, ibm; one recorder each, 60s): every
+  frame of every camera recorded. the quickcam and the nx were on the same
+  usb bus, both at their largest reservation.
+- a recorder that dies without stopping the stream (kill -9, crash) used to
+  leave the quickcam unable to start again. the stv06xx driver now switches
+  the stream off first thing at init.
+- `--test-faults N:abandon` stalls the stream and then does not wait for the
+  cancelled usb transfers, which is how the engine once crashed at exit.
+- ibm: the start of frame marker is just `00 ff`, which can also be two
+  pixels. a marker that would end a frame early is treated as picture data.
 - not done yet: syphon output, white balance for raw cameras, keeping the raw
   bayer bytes, snapshot button (interrupt ep 0x82), controls
   for brightness/contrast/gamma/sharpness.
