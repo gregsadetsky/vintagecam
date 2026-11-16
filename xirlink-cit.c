@@ -18,6 +18,12 @@ struct sd {
 	int sof_read;
 	int sof_len;
 	int skip_first;		/* the frame in flight at start is not whole */
+	/* exposure. the "lighting" function (0..2) is the only strong handle:
+	 * measured on a real unit in one scene, mean picture level and frame
+	 * rate were 87 at 9 fps (0), 179 at 6.5 fps (1), 220 at 3.5 fps (2).
+	 * it cannot change while streaming, so a change restarts the stream. */
+	int lighting, auto_exp;
+	int too_bright, too_dark, hold;
 };
 
 static void cit_write_reg(struct cam *c, u16 value, u16 index)
@@ -85,6 +91,13 @@ static int cit_init(struct cam *c)
 	if (!sd)
 		return -1;
 	c->priv = sd;
+	sd->auto_exp = c->exposure < 0;
+	sd->lighting = c->exposure < 0 ? (c->drv_state ? c->drv_state - 1 : 1)
+				       : c->exposure;
+	if (sd->lighting > 2) {
+		fprintf(stderr, "cit: exposure is 0, 1 or 2\n");
+		return -1;
+	}
 	if (c->width == 0)
 		c->width = 320;
 	if (c->width == 320) {
@@ -159,7 +172,7 @@ static int cit_start(struct cam *c)
 	/* frame rate, range [0..0x1f], see the long note in the kernel */
 	cit_model2_Packet1(c, 0x001c, clock_div);
 	cit_model2_Packet1(c, 0x0026, wide ? 0x0048 : 0x0044);
-	cit_model2_Packet1(c, 0x0028, 1);	/* lighting control default */
+	cit_model2_Packet1(c, 0x0028, sd->lighting);	/* kernel default: 1 */
 	/* color balance rg2 */
 	cit_model2_Packet1(c, 0x001e, 0x002f);
 	/* saturation */
@@ -178,6 +191,8 @@ static int cit_start(struct cam *c)
 	libusb_clear_halt(c->h, c->drv->iso_ep);
 	sd->sof_read = 0;
 	sd->skip_first = 1;
+	sd->too_bright = sd->too_dark = 0;
+	sd->hold = 20;		/* frames to wait before judging */
 
 	/* control defaults: brightness 32 of 0..63, hue 63 of 0..127 */
 	cit_model2_Packet1(c, 0x001a, 0x60 + 32 * 2254 / 1000);
@@ -222,6 +237,40 @@ static const u8 *cit_find_sof(struct sd *sd, const u8 *data, int len)
 	return NULL;
 }
 
+/* called with a whole frame (minus its last packet) in c->frame. about two
+ * seconds of frames that are too bright or too dark move the lighting step
+ * and ask the engine to restart the stream. the limits are far enough apart
+ * that one step cannot bounce back (a step is roughly a factor of two). */
+static void cit_auto_exposure(struct cam *c, struct sd *sd)
+{
+	long sum = 0;
+	int i, n = 0, mean;
+
+	if (sd->hold > 0) {
+		sd->hold--;
+		return;
+	}
+	for (i = 0; i < c->frame_len; i += 97) {
+		sum += c->frame[i];
+		n++;
+	}
+	mean = n ? sum / n : 0;
+	sd->too_bright = mean > 175 ? sd->too_bright + 1 : 0;
+	sd->too_dark = mean < 55 ? sd->too_dark + 1 : 0;
+	if (sd->too_bright >= 15 && sd->lighting > 0)
+		sd->lighting--;
+	else if (sd->too_dark >= 15 && sd->lighting < 2)
+		sd->lighting++;
+	else
+		return;
+	fprintf(stderr, "cit: picture level %d, exposure step -> %d\n", mean,
+		sd->lighting);
+	c->drv_state = sd->lighting + 1;	/* survives a device reopen */
+	c->want_restart = "exposure change";
+	sd->too_bright = sd->too_dark = 0;
+	sd->hold = 1000;			/* until the restart happens */
+}
+
 static void cit_pkt_scan(struct cam *c, const u8 *data, int len)
 {
 	struct sd *sd = c->priv;
@@ -247,6 +296,9 @@ static void cit_pkt_scan(struct cam *c, const u8 *data, int len)
 			frame_add(c, DISCARD_PACKET, NULL, 0);
 		else if (c->last_pkt != DISCARD_PACKET)
 			sd->skip_first = 0;
+		if (sd->auto_exp && c->last_pkt != DISCARD_PACKET &&
+		    c->frame_len + n == want)
+			cit_auto_exposure(c, sd);
 		frame_add(c, LAST_PACKET, data, n);
 		frame_add(c, FIRST_PACKET, NULL, 0);
 		len -= sof - data;

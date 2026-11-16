@@ -55,10 +55,10 @@ static const struct cam_driver *drivers[] = {
 #define N_DRIVERS (sizeof drivers / sizeof drivers[0])
 
 enum fault { FAULT_NONE, FAULT_STALL, FAULT_CORRUPT, FAULT_CTRL, FAULT_SUBMIT,
-	     FAULT_GONE, FAULT_START };
+	     FAULT_GONE, FAULT_START, FAULT_DRIVER };
 static const char *fault_name[] = { "none", "no good frames", "bad frame run",
 	"control transfer error", "iso submit error", "device gone",
-	"start failed" };
+	"start failed", "the driver asked for a restart" };
 
 static volatile sig_atomic_t stopping;
 static libusb_context *ctx;
@@ -1255,6 +1255,11 @@ int main(int argc, char **argv)
 				if (c->usb_err && !fault)
 					fault = FAULT_CTRL;
 			}
+			if (c->want_restart && !fault) {
+				event("driver: %s", c->want_restart);
+				fault = FAULT_DRIVER;
+			}
+			c->want_restart = NULL;
 			pthread_mutex_lock(&h_mu);
 			last_good = h_last_good;
 			bad_run = h_bad_run;

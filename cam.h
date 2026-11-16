@@ -57,6 +57,8 @@ struct cam {
 	int frame_len, frame_cap;
 	enum pkt_type last_pkt;
 	int frame_seq;		/* camera's own frame counter, -1 if none */
+	const char *want_restart;	/* driver asks for a stream restart, and why */
+	int drv_state;		/* small driver memory that outlives priv, 0 = unset */
 	void (*on_frame)(struct cam *c, const u8 *data, int len);
 
 	void *priv;

@@ -395,6 +395,16 @@ static void ov519_pkt_scan(struct cam *c, const u8 *data, int len)
 				frame_add(c, DISCARD_PACKET, NULL, 0);
 			return;
 		case 0x51:		/* end of frame */
+			if (c->verbose && c->last_pkt != DISCARD_PACKET) {
+				int declared = (data[14] | data[15] << 8) * 8;
+
+				if (declared != c->frame_len || data[9] != 0)
+					fprintf(stderr, "ov519: eof declared %d bytes, got %d, "
+						"flag9 %02x, hdr %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						declared, c->frame_len, data[9],
+						data[4], data[5], data[6], data[7], data[8],
+						data[10], data[11], data[12], data[13], data[3]);
+			}
 			if (data[9] != 0)
 				frame_add(c, DISCARD_PACKET, NULL, 0);
 			/* not in the kernel: the bridge pads the jpeg with
