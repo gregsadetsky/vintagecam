@@ -321,8 +321,10 @@ static void *sink_main(void *arg)
 			gen = f->gen;
 			prev_seq = -1;
 		}
-		if (f->cam_seq >= 0 && prev_seq >= 0) {
-			int gap = (f->cam_seq - prev_seq - 1) & 0xffff;
+		/* the counter was seen wrapping from 65495 to 0 with no frame
+		 * lost, so a backwards step is a wrap, not a gap */
+		if (f->cam_seq > prev_seq && prev_seq >= 0) {
+			int gap = f->cam_seq - prev_seq - 1;
 
 			if (gap > 0 && gap < 1000)
 				h_cam_missed += gap;
