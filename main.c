@@ -57,6 +57,7 @@ int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt)
 			fprintf(stderr, "poke %s %04x: %02x -> %02x\n",
 				kind == 'r' ? "reg" : "i2c", idx, dflt,
 				c->pokes[i].val);
+			c->pokes[i].used = 1;
 			return c->pokes[i].val;
 		}
 	return dflt;

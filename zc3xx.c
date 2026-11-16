@@ -284,6 +284,25 @@ static int zc3xx_start(struct cam *c)
 
 	usb_exchange(c, scale ? gc0303_InitialScale : gc0303_Initial);
 
+	/* not in the kernel: with the table's 0x17 = 0xe8 the 320x240 picture
+	 * has green swapped with red/blue (checked on ntsc bars: out G =
+	 * avg(R, B), out R = B = G). 0xe9 gives the right bar order. */
+	if (scale)
+		i2c_write(c, 0x17, poke_lookup(c, 'i', 0x17, 0xe9), 0x00);
+
+	/* debug pokes for registers the table never writes */
+	for (int i = 0; i < c->n_pokes; i++) {
+		if (c->pokes[i].used)
+			continue;
+		fprintf(stderr, "poke %s %04x: (not in table) -> %02x\n",
+			c->pokes[i].kind == 'r' ? "reg" : "i2c",
+			c->pokes[i].idx, c->pokes[i].val);
+		if (c->pokes[i].kind == 'i')
+			i2c_write(c, c->pokes[i].idx, c->pokes[i].val, 0x00);
+		else
+			reg_w(c, c->pokes[i].val, c->pokes[i].idx);
+	}
+
 	reg_r(c, 0x0002);		/* --> 0x40 */
 	reg_w(c, 0x09, 0x01ad);		/* (from win traces) */
 	reg_w(c, 0x15, 0x01ae);

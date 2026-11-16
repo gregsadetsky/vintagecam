@@ -39,7 +39,7 @@ struct cam {
 
 	/* debug: override values the driver's init tables write.
 	 * kind 'r' bridge register, 'i' sensor i2c register */
-	struct { char kind; unsigned idx, val; } pokes[32];
+	struct { char kind; unsigned idx, val; int used; } pokes[32];
 	int n_pokes;
 
 	/* frame assembly */
