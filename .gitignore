@@ -1,0 +1,17 @@
+# build output
+vintagecam
+vintagegrid
+*.o
+*.dSYM/
+
+# recordings
+recordings/
+*.mjpeg
+*.mjpeg.csv
+*.mjpeg.events.csv
+*.mjpeg.bad
+*.mkv
+
+.DS_Store
+.claude/
+.claude-logs/

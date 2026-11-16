@@ -1,117 +1,144 @@
 # vintagecam
 
-userspace libusb drivers for pre-uvc usb webcams on macos. one binary, picks
-the driver by usb vid:pid, records and previews jpeg frames.
+userspace drivers for old (pre-uvc) usb webcams on macos. the linux kernel
+still knows how to talk to these cameras, macos never did, so this ports the
+kernel's gspca drivers to libusb and adds a recorder that tries hard not to
+lose or corrupt frames.
+
+tested on macos 15, apple silicon, with the real cameras listed below.
 
 ```sh
 brew install libusb ffmpeg jpeg-turbo
 make
-make view                          # preview window only
-make record                        # record to recordings/ with a preview window
-make record ARGS="--width 320"     # vf0250: 320x240, about twice the frame rate
-./vintagecam --list                # connected supported cameras and their usb path
-./vintagecam --record DIR --preview --device 2-1.4
+./vintagecam --list         # supported cameras that are plugged in, and their usb path
+make view                   # preview window for the first camera
+make record                 # record it to recordings/, with a preview window
+make wall                   # record every camera, one window showing all of them
 ```
 
-one process drives one camera. run one per camera, picked with `--device`
-(the usb path from `--list`, stable for a given physical port).
+## cameras
+
+| camera | usb id | chips | modes (measured) |
+| --- | --- | --- | --- |
+| creative vf0250 | 041e:4051 | zc3xx + gc0303 | 640x480 ~14 fps, 320x240 ~28 fps, jpeg |
+| creative webcam nx (pd1110) | 041e:401c | zc3xx + pas106 | 352x288, ~9 to 37 fps depending on the scene, jpeg. 176x144 written, never run |
+| logitech quickcam express | 046d:0840 | stv0600 + pb0100 | 320x240 ~10 fps, 352x288 ~8 fps, raw bayer |
+| lego camera / quickcam web | 046d:0850 | stv0610 + vv6410 | 356x292 ~8 fps, raw bayer |
+| ibm pc camera (xirlink c-it) | 0545:8080, version 3.0a | xirlink cit model 2 | 320x240 ~9 / 6.5 / 3.5 fps by exposure step, 352x288 ~4.6 fps, raw bayer |
+| sony eyetoy | 054c:0154 | ov519 + ov7648 | 640x480 ~7 fps, 320x240 ~15 fps, jpeg |
+
+the first size is the default, `--width N` picks another. only these exact
+chip pairs are ported: a quickcam express with an hdcs sensor, other ibm
+models, other ov519 sensors and so on are refused at start with a message.
+
+## how it runs
+
+one process drives one camera. `--device USBPATH` (from `--list`) picks which.
 
 - `--record DIR` writes every good frame to
   `DIR/<time>-<camera>-usb<path>.mjpeg`: the camera's own jpeg bytes if it
-  sends jpeg, otherwise (raw bayer cameras) demosaiced and encoded here at
-  quality 95, 4:4:4. next to it: `.csv` (frame number,
-  seconds since first frame, unix time, byte offset, size, camera frame
-  counter), `.events.csv` (faults and recoveries) and `.bad` (up to 200
-  rejected frames, for a post mortem). it never overwrites a file.
+  sends jpeg, otherwise the raw bayer frame demosaiced and encoded at quality
+  95. next to it: `.csv` (frame number, seconds since the first frame, unix
+  time, byte offset, size, camera frame counter), `.events.csv` (faults and
+  recoveries) and `.bad` (up to 200 rejected frames). existing files are never
+  overwritten.
 - `--preview` opens an ffplay window fed only the latest frame, so it can lag
   or be closed without touching the recording.
-- `--stdout` writes the raw frame stream to a pipe.
+- `--stdout` writes the frame stream to a pipe.
 
-## when things go wrong
+`make wall` (or `./wall.sh DIR`) starts one recorder per connected camera and
+one grid window, `vintagegrid`, that shows the latest frame of every recording
+growing in the folder. the grid only reads the files, so it cannot disturb a
+recorder. a tile goes dim when its camera has sent nothing for 2s. closing the
+grid stops all recorders. a recorder that dies is started again, up to 5 times.
 
-every jpeg frame is fully decoded (turbojpeg) before it is written. a frame
-that does not decode cleanly at the expected size is dropped, never recorded.
-raw frames can only be checked for their exact byte count.
-the main loop restarts things when there has been no good frame for 2s, 20
-bad frames in a row, a usb control or iso error, or the device vanished:
-first the stream, then (if that produced nothing) close and reopen the
-device, then a usb port reset, and it keeps waiting for the camera to come
-back on the same usb port for as long as it takes. the recording file stays
-open the whole time, so an outage is a gap in the index, not a broken file.
-
-`--export` turns a recording into constant frame rate video in real time,
-with black frames wherever there was a gap over 0.5s:
+`--export` turns a recording into constant frame rate video in real time. a
+skipped frame repeats the previous one, a gap over 0.5s becomes black:
 
 ```sh
 ./vintagecam --export rec.mjpeg --fps 30 | ffmpeg -f mjpeg -framerate 30 -i - -c copy rec.mkv
 ```
 
-`--test-faults 8:break,20:stall,32:corrupt,48:reset` triggers faults at those
-seconds: `break` writes a register that makes the camera send garbage,
-`stall` drops all incoming data, `corrupt` damages incoming data for 4s,
-`reset` does a usb port reset under the running stream.
+## when things go wrong
 
-what it cannot catch: a picture that is a valid jpeg but looks wrong (bad
-colors, frozen, black).
+every jpeg frame is fully decoded before it is written, and one that does not
+decode cleanly at the expected size is dropped. raw frames are checked for
+their exact byte count.
 
-other flags: `--width N` (see the cameras table, first size is the default),
-`--exposure N` / `--gain N` (fixed values instead of auto, quickcam only so
-far), `--bayer grbg|rggb|bggr|gbrg` (override the raw layout), `--freq 0|50|60`
-(mains flicker table, 0 = none, vf0250 only), `--frames N`, `--seconds S`, `--alt N` (usb bandwidth
-reservation, see notes), `--dump-packets N`, `-v` (stats on stderr),
-`--reg HEX=HEX` / `--i2c HEX=HEX` (override a value the init table writes to a
-bridge / sensor register, or write an extra one, for experiments).
+a watchdog restarts things when there has been no good frame for 2s, 20 bad
+frames in a row, a usb error, or the camera vanished: first the stream, then
+the device, then a usb port reset, then it waits for the camera for as long as
+it takes. the recording file stays open through all of it, so an outage is a
+gap in the index and not a broken file.
 
-## cameras
+when a camera comes back on another usb port its recorder follows it, as long
+as it is the only free camera of that model. a different model sitting on the
+old port is left alone. identical cameras have no serial numbers, so with two
+free ones of the same model the recorder waits on its original port.
 
-| camera | usb id | chips | status |
-| --- | --- | --- | --- |
-| creative vf0250 | 041e:4051 | zc3xx bridge + gc0303 sensor | works, mjpeg, 640x480 ~14 fps and 320x240 ~28 fps |
-| logitech quickcam express | 046d:0840 | stv0600 bridge + pb0100 sensor | works, raw bayer, 320x240 ~10 fps and 352x288 ~8 fps. units with an hdcs sensor: not ported |
-| lego camera (quickcam web) | 046d:0850 | stv0610 bridge + vv6410 sensor | works, raw bayer, 356x292 ~8.5 fps |
-| creative webcam nx (pd1110) | 041e:401c | zc3xx bridge + pas106 sensor | works, mjpeg, 352x288 ~9 to 20 fps depending on the scene. 176x144 written, not run |
-| ibm pc camera | 0545:8080, device version 3.0a | xirlink cit, model 2 | works, raw bayer, 320x240 ~7.5 fps and 352x288 ~4.6 fps. 176x144 and other models: not ported |
-| sony eyetoy | 054c:0154 | ov519 | not working: this unit's usb config descriptor reads back as 0xff after byte 20, so macos never sees the video endpoint. cause unexplained |
+what it cannot catch: a picture that is valid but looks wrong.
+
+## flags
+
+`--width N`, `--exposure N` / `--gain N` (fixed values where the driver has
+its own auto exposure: quickcam, lego, ibm), `--freq 0|50|60` (mains flicker,
+zc3xx and eyetoy), `--bayer grbg|rggb|bggr|gbrg`, `--alt N` (usb bandwidth
+reservation), `--frames N`, `--seconds S`, `-v`, `--dump-packets N`,
+`--reg HEX=HEX` / `--i2c HEX=HEX` (override a bridge / sensor register value
+the driver writes, for experiments),
+`--test-faults SEC:stall|corrupt|reset|break|abandon|hide,...` (make things go
+wrong on purpose at those seconds).
 
 ## adding a camera
 
 the engine is shaped like linux gspca (`init`, `start`, `poll`, `stop`,
 `pkt_scan`, `frame_add` with FIRST/INTER/LAST/DISCARD), so a gspca subdriver
-ports over mostly by copying. add a `struct cam_driver` and list it in
-`drivers[]` in main.c. `--dump-packets` shows raw iso packets for checking
-frame headers against what the kernel source says.
+ports over mostly by copying. write a `struct cam_driver`, list it in
+`drivers[]` in main.c. a driver that sets `.bayer` hands over raw frames and
+the engine makes the jpegs. `--dump-packets` shows raw iso packets for checking
+frame headers against the kernel source.
 
-## notes
+## things the kernel drivers did not cover
+
+found on the real cameras. each is a small deviation from the kernel code,
+commented where it lives. "why" is unknown for all of them.
 
 - vf0250 at 320x240: with the kernel table as is, green comes out swapped with
-  red/blue. the driver writes sensor reg 0x17 = 0xe9 (table says 0xe8) in 320
-  mode, which gives the right order on ntsc bars over 5 starts. why one extra
-  row fixes it: unexplained. `--i2c 17=e8` brings the old behaviour back.
-- usb bandwidth: the default alt setting reserves the most (896 bytes/ms on
-  the vf0250). measured on the vf0250, 6s runs: 320x240 keeps its full 28 fps
-  down to `--alt 4` (384 bytes/ms) and 27.6 fps at `--alt 3` (256); 640x480
-  needs alt 7 for 14 fps (alt 5 gives 11, alt 4 gives 8.5, below that nothing).
-  smaller reservations should let more cameras share a bus (untested: the two
-  cameras so far ran together fine, but on different buses).
-- quickcam express: the sensor's own auto exposure stayed near white for every
-  target tried (why: unexplained), so the driver runs its own: it nudges the
-  row integration time, then the gain, toward a mean raw value of 105.
-  integration time above about 0xf0 lowers the frame rate, so it stops there.
-  no white balance yet, the picture is a little green. its one alt setting
-  reserves 1023 bytes/ms, which is most of a full speed bus.
-- macos leaves these devices unconfigured, so the engine sets configuration 1
-  before claiming the interface.
-- `gspca/` holds headers and tables copied from the linux kernel, hence gpl.
-- four cameras at once (quickcam, lego, nx, ibm; one recorder each, 60s): every
-  frame of every camera recorded. the quickcam and the nx were on the same
-  usb bus, both at their largest reservation.
-- a recorder that dies without stopping the stream (kill -9, crash) used to
-  leave the quickcam unable to start again. the stv06xx driver now switches
-  the stream off first thing at init.
-- `--test-faults N:abandon` stalls the stream and then does not wait for the
-  cancelled usb transfers, which is how the engine once crashed at exit.
+  red and blue. sensor register 0x17 = 0xe9 instead of 0xe8 fixes it (checked
+  on colour bars). `--i2c 17=e8` brings the old behaviour back.
+- quickcam express: the sensor's own auto exposure sat near white for every
+  target tried, so the driver runs its own from the frame brightness. the lego
+  camera reuses it.
+- quickcam and lego: a recorder that died without stopping the stream left the
+  bridge unable to start again. the driver switches the stream off first.
+- lego: one bridge register write is answered with a stall. the kernel ignores
+  the error, so does this.
 - ibm: the start of frame marker is just `00 ff`, which can also be two
-  pixels. a marker that would end a frame early is treated as picture data.
-- not done yet: syphon output, white balance for raw cameras, keeping the raw
-  bayer bytes, snapshot button (interrupt ep 0x82), controls
-  for brightness/contrast/gamma/sharpness.
+  pixels. a marker that would end a frame early is taken as picture. exposure
+  is one three step setting that also sets the frame rate, the driver picks
+  the step from the picture.
+- eyetoy: each jpeg is padded with zero bytes after its end marker, which are
+  trimmed. the camera flags about 1 frame in 100 as bad itself, more with many
+  cameras running, those are skipped.
+- webcam nx: after a replug one unit kept identifying itself as ff1e:ffff
+  while working normally. that id is accepted too, the sensor probe still has
+  to pass.
+
+other notes:
+
+- macos leaves these devices unconfigured, the engine sets configuration 1.
+- plugging or unplugging anything can stall cameras on other usb buses for a
+  moment. they recover, but do not replug mid take.
+- seven cameras (one of each, two ibms) recorded together on one laptop, four
+  of them on a single full speed bus behind hubs.
+- starting a recorder at the instant a camera is being reset can crash inside
+  libusb's own device scan (1.0.30). `wall.sh` restarts it.
+- no white balance for the raw cameras yet, no audio, no snapshot buttons, no
+  virtual camera for other apps yet.
+
+## license
+
+GPL-2.0-or-later, see LICENSE. the drivers are ports of the linux kernel's
+gspca drivers (zc3xx, stv06xx, xirlink_cit, ov519) and `gspca/` holds tables
+and headers copied from the kernel. the original authors are named at the top
+of each file.
