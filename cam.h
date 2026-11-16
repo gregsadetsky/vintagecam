@@ -25,6 +25,8 @@ struct cam_driver {
 	void (*poll)(struct cam *c);	/* about every 100ms while streaming */
 	void (*stop)(struct cam *c);	/* after alt 0 */
 	void (*pkt_scan)(struct cam *c, const u8 *data, int len);
+	/* test hook: make the camera itself misbehave (optional) */
+	void (*test_break)(struct cam *c);
 };
 
 struct cam {
@@ -46,6 +48,7 @@ struct cam {
 	u8 *frame;
 	int frame_len, frame_cap;
 	enum pkt_type last_pkt;
+	int frame_seq;		/* camera's own frame counter, -1 if none */
 	void (*on_frame)(struct cam *c, const u8 *data, int len);
 
 	void *priv;
@@ -56,5 +59,7 @@ void msleep(int ms);
 int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt);
 
 extern const struct cam_driver zc3xx_gc0303_driver;
+
+int export_main(const char *mjpeg_path, double fps);
 
 #endif

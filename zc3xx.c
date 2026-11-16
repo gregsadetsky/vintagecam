@@ -401,10 +401,19 @@ static void zc3xx_pkt_scan(struct cam *c, const u8 *data, int len)
 		 */
 		if (len < 18)
 			return;
+		c->frame_seq = data[8] << 8 | data[9];
 		data += 18;
 		len -= 18;
 	}
 	frame_add(c, INTER_PACKET, data, len);
+}
+
+/* test hook: clock select 0 in the middle of a stream. seen to stop this
+ * camera from producing usable frames until the init table is rewritten */
+static void zc3xx_test_break(struct cam *c)
+{
+	c->usb_err = 0;
+	reg_w(c, 0x00, ZC3XX_R002_CLOCKSELECT);
 }
 
 const struct cam_driver zc3xx_gc0303_driver = {
@@ -418,4 +427,5 @@ const struct cam_driver zc3xx_gc0303_driver = {
 	.poll = zc3xx_poll,
 	.stop = zc3xx_stop,
 	.pkt_scan = zc3xx_pkt_scan,
+	.test_break = zc3xx_test_break,
 };

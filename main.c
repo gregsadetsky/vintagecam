@@ -2,16 +2,27 @@
 /*
  * vintagecam: userspace libusb drivers for pre-uvc webcams on macos.
  * one process drives one camera. frames go to any of:
- *   --record DIR   every frame, written by a writer thread (never dropped
- *                  unless the queue cap is hit, which is reported)
- *   --preview      an ffplay window fed the latest frame only (lossy on
+ *   --record DIR   every good frame, written by the sink thread
+ *   --preview      an ffplay window fed the latest good frame only (lossy on
  *                  purpose, it can never slow the usb side down)
  *   --stdout       the raw frame stream, for piping
+ *
+ * threads:
+ *   usb (main)  iso packets -> frames -> queue. never blocks on disk.
+ *   sink        decodes every frame to check it, drops bad ones, writes
+ *               good ones, keeps the health numbers the watchdog reads.
+ *   preview     blocking writes to the ffplay pipe.
+ *
+ * the main loop is a watchdog: no good frame for a while, a run of bad
+ * frames, usb errors or the device vanishing all lead to a restart, first of
+ * the stream, then of the whole device, then waiting for it to come back.
+ * the recording file stays open through all of that.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +31,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <turbojpeg.h>
 #include "cam.h"
 
 #define N_XFERS 4
@@ -27,27 +39,42 @@
 #define FRAME_CAP (1 << 20)
 #define QUEUE_CAP_BYTES (256u << 20)
 
+#define STALL_SECONDS 2.0	/* no good frame for this long -> restart */
+#define START_GRACE 1.0		/* extra allowance right after a (re)start */
+#define BAD_RUN_LIMIT 20	/* this many bad frames in a row -> restart */
+#define BAD_SAVE_LIMIT 200	/* bad frames kept for a post mortem */
+
 static const struct cam_driver *drivers[] = {
 	&zc3xx_gc0303_driver,
 };
 #define N_DRIVERS (sizeof drivers / sizeof drivers[0])
 
+enum fault { FAULT_NONE, FAULT_STALL, FAULT_CORRUPT, FAULT_CTRL, FAULT_SUBMIT,
+	     FAULT_GONE, FAULT_START };
+static const char *fault_name[] = { "none", "no good frames", "bad frame run",
+	"control transfer error", "iso submit error", "device gone",
+	"start failed" };
+
 static volatile sig_atomic_t stopping;
-static int active_xfers;
-static long n_frames, n_frame_bytes, n_iso_errs, n_discards, n_pkts;
+static libusb_context *ctx;
+static struct libusb_transfer *xfers[N_XFERS];
+static int active_xfers, stream_halt, stream_gen;
+static enum fault fault;
+static int cur_alt = -1, cur_maxpkt;
+static long n_frames, n_frame_bytes, n_iso_errs, n_xfer_errs, n_discards;
+static long n_restarts, n_reopens;
 static long max_frames = -1;
-static double max_seconds;
+static double max_seconds, t_run0;
 static int dump_pkts;
 
 /* time of the iso packet being scanned, and of the current frame's first one */
 static double cur_pkt_time, frame_start_time;
 
-/* ---- lossless queue -> writer thread (record file and/or stdout) ---- */
+/* ---- queue: usb thread -> sink thread ---- */
 struct qframe {
 	struct qframe *next;
-	long seq;
 	double t;
-	int len;
+	int gen, cam_seq, len;
 	u8 data[];
 };
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -57,14 +84,23 @@ static size_t q_bytes, q_peak_bytes;
 static long q_dropped;
 static int q_done;
 
-static int use_queue, use_stdout;
-static int rec_fd = -1;
-static FILE *rec_idx;
+/* ---- health, written by the sink thread, read by the watchdog ---- */
+static pthread_mutex_t h_mu = PTHREAD_MUTEX_INITIALIZER;
+static double h_last_good;
+static int h_bad_run;
+static long h_good, h_bad, h_cam_missed;
+
+/* ---- sinks ---- */
+static int use_stdout;
+static int rec_fd = -1, bad_fd = -1;
+static FILE *rec_idx, *ev_file;
 static char rec_path[1024];
-static long rec_written;
+static long rec_written, bad_saved;
 static int rec_failed;
 static double rec_t_first = -1, rec_t_last;
 static double wall_minus_mono;
+static int want_w, want_h;
+static pthread_mutex_t ev_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- lossy preview: one slot holding the latest frame ---- */
 static pthread_mutex_t pv_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -75,6 +111,13 @@ static int pv_fd = -1;
 static pid_t pv_pid = -1;
 static volatile sig_atomic_t pv_dead;
 static long pv_shown;
+
+/* ---- test hooks (--test-faults) ---- */
+enum { TF_STALL, TF_CORRUPT, TF_RESET, TF_BREAK };
+static struct { double at; int kind, done; } tfaults[16];
+static int n_tfaults;
+static int sim_stall;
+static double sim_corrupt_until;
 
 static void on_signal(int sig)
 {
@@ -95,6 +138,26 @@ static double now(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* one line to stderr and to the recording's event log */
+static void event(const char *fmt, ...)
+{
+	char msg[512];
+	va_list ap;
+	double t = now();
+
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof msg, fmt, ap);
+	va_end(ap);
+	pthread_mutex_lock(&ev_mu);
+	fprintf(stderr, "[%8.2fs] %s\n", t_run0 > 0 ? t - t_run0 : 0.0, msg);
+	if (ev_file) {
+		fprintf(ev_file, "%.3f,%.3f,%s\n", t + wall_minus_mono,
+			rec_t_first >= 0 ? t - rec_t_first : 0.0, msg);
+		fflush(ev_file);
+	}
+	pthread_mutex_unlock(&ev_mu);
 }
 
 static int write_all(int fd, const u8 *data, int len)
@@ -147,8 +210,8 @@ void frame_add(struct cam *c, enum pkt_type type, const u8 *data, int len)
 	}
 	if (len > 0) {
 		if (c->frame_len + len > c->frame_cap) {
-			fprintf(stderr, "frame overflow, discarding\n");
 			c->last_pkt = DISCARD_PACKET;
+			n_discards++;
 			return;
 		}
 		memcpy(c->frame + c->frame_len, data, len);
@@ -164,53 +227,77 @@ void frame_add(struct cam *c, enum pkt_type type, const u8 *data, int len)
 /* runs on the usb thread: must never block on disk or on a reader */
 static void on_frame(struct cam *c, const u8 *data, int len)
 {
-	(void)c;
-	if (use_queue) {
-		struct qframe *f = malloc(sizeof *f + len);
+	struct qframe *f = malloc(sizeof *f + len);
 
-		pthread_mutex_lock(&q_mu);
-		if (!f || q_bytes + len > QUEUE_CAP_BYTES) {
-			q_dropped++;
-			free(f);
-		} else {
-			f->next = NULL;
-			f->seq = n_frames;
-			f->t = frame_start_time;
-			f->len = len;
-			memcpy(f->data, data, len);
-			if (q_tail)
-				q_tail->next = f;
-			else
-				q_head = f;
-			q_tail = f;
-			q_bytes += len;
-			if (q_bytes > q_peak_bytes)
-				q_peak_bytes = q_bytes;
-			pthread_cond_signal(&q_cv);
-		}
-		pthread_mutex_unlock(&q_mu);
+	pthread_mutex_lock(&q_mu);
+	if (!f || q_bytes + len > QUEUE_CAP_BYTES) {
+		q_dropped++;
+		free(f);
+	} else {
+		f->next = NULL;
+		f->t = frame_start_time;
+		f->gen = stream_gen;
+		f->cam_seq = c->frame_seq;
+		f->len = len;
+		memcpy(f->data, data, len);
+		if (q_tail)
+			q_tail->next = f;
+		else
+			q_head = f;
+		q_tail = f;
+		q_bytes += len;
+		if (q_bytes > q_peak_bytes)
+			q_peak_bytes = q_bytes;
+		pthread_cond_signal(&q_cv);
 	}
-	if (pv_fd >= 0 && !pv_dead && len <= FRAME_CAP) {
-		pthread_mutex_lock(&pv_mu);
-		memcpy(pv_buf, data, len);
-		pv_len = len;
-		pv_fresh = 1;
-		pthread_cond_signal(&pv_cv);
-		pthread_mutex_unlock(&pv_mu);
-	}
+	pthread_mutex_unlock(&q_mu);
 	n_frames++;
 	n_frame_bytes += len;
-	if (max_frames > 0 && n_frames >= max_frames)
-		stopping = 1;
 }
 
-static void *writer_main(void *arg)
+/* decode the whole frame. anything short of a clean decode at the expected
+ * size is a bad frame (turbojpeg reports libjpeg warnings such as
+ * "premature end of data" or "extraneous bytes" as failures here). */
+static const char *frame_problem(tjhandle tj, u8 *scratch, const u8 *d, int len)
 {
+	int w, h, sub, cs;
+
+	if (len < 4 || d[0] != 0xff || d[1] != 0xd8)
+		return "no jpeg start";
+	if (d[len - 2] != 0xff || d[len - 1] != 0xd9)
+		return "no jpeg end";
+	if (tjDecompressHeader3(tj, d, len, &w, &h, &sub, &cs))
+		return tjGetErrorStr2(tj);
+	if (w != want_w || h != want_h)
+		return "wrong size";
+	if (tjDecompress2(tj, d, len, scratch, w, 0, h, TJPF_GRAY, TJFLAG_FASTDCT))
+		return tjGetErrorStr2(tj);
+	return NULL;
+}
+
+static void preview_push(const u8 *data, int len)
+{
+	if (pv_fd < 0 || pv_dead || len > FRAME_CAP)
+		return;
+	pthread_mutex_lock(&pv_mu);
+	memcpy(pv_buf, data, len);
+	pv_len = len;
+	pv_fresh = 1;
+	pthread_cond_signal(&pv_cv);
+	pthread_mutex_unlock(&pv_mu);
+}
+
+static void *sink_main(void *arg)
+{
+	tjhandle tj = tjInitDecompress();
+	u8 *scratch = malloc((size_t)want_w * want_h);
 	long long offset = 0;
+	int gen = -1, prev_seq = -1;
 
 	(void)arg;
 	for (;;) {
 		struct qframe *f;
+		const char *why;
 
 		pthread_mutex_lock(&q_mu);
 		while (!q_head && !q_done)
@@ -226,22 +313,59 @@ static void *writer_main(void *arg)
 		if (!f)
 			break;
 
+		why = (tj && scratch) ? frame_problem(tj, scratch, f->data, f->len)
+				      : "no decoder";
+
+		pthread_mutex_lock(&h_mu);
+		if (f->gen != gen) {		/* stream was restarted */
+			gen = f->gen;
+			prev_seq = -1;
+		}
+		if (f->cam_seq >= 0 && prev_seq >= 0) {
+			int gap = (f->cam_seq - prev_seq - 1) & 0xffff;
+
+			if (gap > 0 && gap < 1000)
+				h_cam_missed += gap;
+		}
+		prev_seq = f->cam_seq;
+		if (why) {
+			h_bad++;
+			h_bad_run++;
+		} else {
+			h_good++;
+			h_bad_run = 0;
+			h_last_good = now();
+		}
+		pthread_mutex_unlock(&h_mu);
+
+		if (why) {
+			if (h_bad <= 5 || h_bad % 100 == 0)
+				event("bad frame (%ld so far): %s, %d bytes",
+				      h_bad, why, f->len);
+			if (bad_fd >= 0 && bad_saved < BAD_SAVE_LIMIT) {
+				write_all(bad_fd, f->data, f->len);
+				bad_saved++;
+			}
+			free(f);
+			continue;
+		}
+
 		if (rec_fd >= 0 && !rec_failed) {
 			if (write_all(rec_fd, f->data, f->len) < 0) {
-				fprintf(stderr, "RECORD WRITE FAILED: %s\n",
-					strerror(errno));
 				rec_failed = 1;
+				event("RECORD WRITE FAILED: %s", strerror(errno));
 				stopping = 1;
 			} else {
 				if (rec_t_first < 0)
 					rec_t_first = f->t;
 				rec_t_last = f->t;
-				fprintf(rec_idx, "%ld,%.6f,%.6f,%lld,%d\n",
-					f->seq, f->t - rec_t_first,
-					f->t + wall_minus_mono, offset, f->len);
+				fprintf(rec_idx, "%ld,%.6f,%.6f,%lld,%d,%d\n",
+					rec_written, f->t - rec_t_first,
+					f->t + wall_minus_mono, offset, f->len,
+					f->cam_seq);
+				fflush(rec_idx);	/* a hard kill loses no rows */
 				offset += f->len;
 				rec_written++;
-				fflush(rec_idx);	/* a hard kill loses no rows */
 			}
 		}
 		if (use_stdout && write_all(STDOUT_FILENO, f->data, f->len) < 0) {
@@ -249,10 +373,14 @@ static void *writer_main(void *arg)
 			if (rec_fd < 0)
 				stopping = 1;
 		}
+		preview_push(f->data, f->len);
+		if (max_frames > 0 && h_good >= max_frames)
+			stopping = 1;
 		free(f);
 	}
-	if (rec_idx)
-		fflush(rec_idx);
+	free(scratch);
+	if (tj)
+		tjDestroy(tj);
 	return NULL;
 }
 
@@ -279,9 +407,9 @@ static void *preview_main(void *arg)
 		if (write_all(pv_fd, buf, len) < 0) {
 			/* window closed. recording carries on without it */
 			pv_dead = 1;
-			fprintf(stderr, "preview closed%s\n",
-				use_queue ? ", still capturing" : "");
-			if (!use_queue)
+			event("preview closed%s",
+			      rec_fd >= 0 || use_stdout ? ", still capturing" : "");
+			if (rec_fd < 0 && !use_stdout)
 				stopping = 1;
 			break;
 		}
@@ -322,7 +450,7 @@ static int start_preview(const char *title)
 
 static int start_record(const char *dir, const char *name, const char *usbpath)
 {
-	char stamp[32], idx_path[1040];
+	char stamp[32], p[1100];
 	time_t t = time(NULL);
 	struct tm tm;
 
@@ -334,19 +462,25 @@ static int start_record(const char *dir, const char *name, const char *usbpath)
 	strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
 	snprintf(rec_path, sizeof rec_path, "%s/%s-%s-usb%s.mjpeg", dir, stamp,
 		 name, usbpath);
-	snprintf(idx_path, sizeof idx_path, "%s.csv", rec_path);
-	/* O_EXCL: never write over an existing recording */
+	/* O_EXCL / "wx": never write over an existing recording */
 	rec_fd = open(rec_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (rec_fd < 0) {
 		fprintf(stderr, "open %s: %s\n", rec_path, strerror(errno));
 		return -1;
 	}
-	rec_idx = fopen(idx_path, "wx");
-	if (!rec_idx) {
-		fprintf(stderr, "open %s: %s\n", idx_path, strerror(errno));
+	snprintf(p, sizeof p, "%s.csv", rec_path);
+	rec_idx = fopen(p, "wx");
+	snprintf(p, sizeof p, "%s.events.csv", rec_path);
+	ev_file = fopen(p, "wx");
+	snprintf(p, sizeof p, "%s.bad", rec_path);
+	bad_fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (!rec_idx || !ev_file || bad_fd < 0) {
+		fprintf(stderr, "cannot create files next to %s: %s\n", rec_path,
+			strerror(errno));
 		return -1;
 	}
-	fprintf(rec_idx, "frame,t_seconds,unix_time,offset,bytes\n");
+	fprintf(rec_idx, "frame,t_seconds,unix_time,offset,bytes,cam_seq\n");
+	fprintf(ev_file, "unix_time,t_seconds,event\n");
 	return 0;
 }
 
@@ -358,23 +492,32 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer *t)
 
 	if (t->status == LIBUSB_TRANSFER_CANCELLED ||
 	    t->status == LIBUSB_TRANSFER_NO_DEVICE) {
-		if (t->status == LIBUSB_TRANSFER_NO_DEVICE)
-			stopping = 1;
+		if (t->status == LIBUSB_TRANSFER_NO_DEVICE && !fault)
+			fault = FAULT_GONE;
 		active_xfers--;
 		return;
 	}
+	if (t->status != LIBUSB_TRANSFER_COMPLETED) {
+		n_xfer_errs++;
+		frame_add(c, DISCARD_PACKET, NULL, 0);
+		goto resubmit;
+	}
 	for (i = 0; i < t->num_iso_packets; i++) {
 		struct libusb_iso_packet_descriptor *p = &t->iso_packet_desc[i];
-		const u8 *data = libusb_get_iso_packet_buffer_simple(t, i);
+		u8 *data = libusb_get_iso_packet_buffer_simple(t, i);
 
 		if (p->status != LIBUSB_TRANSFER_COMPLETED) {
 			n_iso_errs++;
 			frame_add(c, DISCARD_PACKET, NULL, 0);
 			continue;
 		}
-		if (p->actual_length == 0)
+		if (p->actual_length == 0 || sim_stall)
 			continue;
-		n_pkts++;
+		if (t_done < sim_corrupt_until && p->actual_length > 64) {
+			data[p->actual_length / 2] ^= 0x5a;
+			data[p->actual_length / 3] = 0xff;
+			data[p->actual_length / 3 + 1] = 0xc4;
+		}
 		/* full speed iso: one packet per 1ms usb frame, so packet i
 		 * arrived this long before the transfer completed */
 		cur_pkt_time = t_done - (t->num_iso_packets - 1 - i) * 0.001;
@@ -394,8 +537,14 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer *t)
 		}
 		c->drv->pkt_scan(c, data, p->actual_length);
 	}
-	if (stopping || libusb_submit_transfer(t) < 0)
+resubmit:
+	if (stream_halt || stopping) {
 		active_xfers--;
+	} else if (libusb_submit_transfer(t) < 0) {
+		active_xfers--;
+		if (!fault)
+			fault = FAULT_SUBMIT;
+	}
 }
 
 struct found {
@@ -404,7 +553,7 @@ struct found {
 	char path[40];		/* bus-port.port, stable per physical port */
 };
 
-static int find_cams(libusb_context *ctx, struct found *out, int max)
+static int find_cams(struct found *out, int max)
 {
 	libusb_device **list;
 	ssize_t cnt = libusb_get_device_list(ctx, &list);
@@ -441,6 +590,231 @@ static int find_cams(libusb_context *ctx, struct found *out, int max)
 	return n;
 }
 
+static void free_cams(struct found *cams, int n)
+{
+	while (n-- > 0)
+		libusb_unref_device(cams[n].dev);
+}
+
+static void close_camera(struct cam *c)
+{
+	if (!c->h)
+		return;
+	libusb_release_interface(c->h, 0);
+	libusb_close(c->h);
+	c->h = NULL;
+	free(c->priv);
+	c->priv = NULL;
+}
+
+/* open the camera at usb path `path` ("" = first one found, and remember
+ * where it was), configure, claim, pick the alt setting, run driver init.
+ * quiet = 1 while polling for a camera that went away. */
+static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
+{
+	struct found cams[16];
+	struct libusb_config_descriptor *cfg = NULL;
+	const struct libusb_interface *intf;
+	int n = find_cams(cams, 16), i, r, cfgval, alt, maxpkt = 0;
+
+	for (i = 0; i < n; i++)
+		if (!path[0] || !strcmp(path, cams[i].path))
+			break;
+	if (i == n) {
+		if (!quiet) {
+			if (path[0])
+				fprintf(stderr, "no supported camera at usb path %s (try --list)\n", path);
+			else
+				fprintf(stderr, "no supported camera found\n");
+		}
+		free_cams(cams, n);
+		return -1;
+	}
+	if (!path[0] && n > 1)
+		fprintf(stderr, "%d cameras connected, using %s (pick with --device)\n",
+			n, cams[i].path);
+	c->drv = cams[i].drv;
+	snprintf(path, 40, "%s", cams[i].path);
+	r = libusb_open(cams[i].dev, &c->h);
+	free_cams(cams, n);
+	if (r < 0) {
+		if (!quiet)
+			fprintf(stderr, "open: %s\n", libusb_error_name(r));
+		c->h = NULL;
+		return -1;
+	}
+
+	/* macos leaves vendor-class devices unconfigured */
+	r = libusb_get_configuration(c->h, &cfgval);
+	if (r < 0 || cfgval != 1)
+		r = libusb_set_configuration(c->h, 1);
+	if (r >= 0)
+		r = libusb_claim_interface(c->h, 0);
+	if (r >= 0)
+		r = libusb_get_config_descriptor(libusb_get_device(c->h), 0, &cfg);
+	if (r < 0) {
+		if (!quiet)
+			fprintf(stderr, "configure/claim: %s\n", libusb_error_name(r));
+		goto fail;
+	}
+	intf = &cfg->interface[0];
+	alt = want_alt < 0 ? intf->num_altsetting - 1 : want_alt;
+	if (alt < 1 || alt >= intf->num_altsetting) {
+		fprintf(stderr, "bad alt %d (1..%d)\n", alt, intf->num_altsetting - 1);
+		goto fail;
+	}
+	for (i = 0; i < intf->altsetting[alt].bNumEndpoints; i++) {
+		const struct libusb_endpoint_descriptor *ep =
+			&intf->altsetting[alt].endpoint[i];
+
+		if (ep->bEndpointAddress == c->drv->iso_ep)
+			maxpkt = ep->wMaxPacketSize & 0x7ff;
+	}
+	libusb_free_config_descriptor(cfg);
+	cfg = NULL;
+	if (maxpkt <= 0) {
+		fprintf(stderr, "iso endpoint %02x not found in alt %d\n",
+			c->drv->iso_ep, alt);
+		goto fail;
+	}
+	cur_alt = alt;
+	cur_maxpkt = maxpkt;
+
+	c->usb_err = 0;
+	if (c->drv->init(c) < 0) {
+		if (!quiet)
+			fprintf(stderr, "driver init failed\n");
+		goto fail;
+	}
+	return 0;
+fail:
+	if (cfg)
+		libusb_free_config_descriptor(cfg);
+	close_camera(c);
+	return -1;
+}
+
+static void drain_xfers(void)
+{
+	double t = now();
+	int i;
+
+	while (active_xfers > 0 && now() - t < 2.0) {
+		struct timeval tv = { 0, 50000 };
+
+		libusb_handle_events_timeout(ctx, &tv);
+	}
+	if (active_xfers > 0) {
+		/* something never completed: leak rather than free in-flight */
+		event("%d iso transfers never returned, abandoning them",
+		      active_xfers);
+		active_xfers = 0;
+		for (i = 0; i < N_XFERS; i++)
+			xfers[i] = NULL;
+		return;
+	}
+	for (i = 0; i < N_XFERS; i++) {
+		if (xfers[i])
+			libusb_free_transfer(xfers[i]);	/* frees its buffer too */
+		xfers[i] = NULL;
+	}
+}
+
+static void stop_stream(struct cam *c, int device_ok)
+{
+	int i;
+
+	stream_halt = 1;
+	for (i = 0; i < N_XFERS; i++)
+		if (xfers[i])
+			libusb_cancel_transfer(xfers[i]);
+	drain_xfers();
+	if (c->h && device_ok) {
+		libusb_set_interface_alt_setting(c->h, 0, 0);
+		c->drv->stop(c);
+	}
+}
+
+static int start_stream(struct cam *c)
+{
+	int i, r;
+
+	fault = FAULT_NONE;
+	stream_halt = 0;
+	sim_stall = 0;
+	stream_gen++;
+	c->usb_err = 0;
+	c->frame_len = 0;
+	c->frame_seq = -1;
+	c->last_pkt = DISCARD_PACKET;
+
+	r = libusb_set_interface_alt_setting(c->h, 0, cur_alt);
+	if (r < 0) {
+		event("set alt %d: %s", cur_alt, libusb_error_name(r));
+		return -1;
+	}
+	if (c->drv->start(c) < 0) {
+		event("driver start failed");
+		return -1;
+	}
+	for (i = 0; i < N_XFERS; i++) {
+		u8 *buf = malloc((size_t)cur_maxpkt * PKTS_PER_XFER);
+
+		xfers[i] = libusb_alloc_transfer(PKTS_PER_XFER);
+		if (!buf || !xfers[i])
+			return -1;
+		libusb_fill_iso_transfer(xfers[i], c->h, c->drv->iso_ep, buf,
+					 cur_maxpkt * PKTS_PER_XFER,
+					 PKTS_PER_XFER, iso_cb, c, 1000);
+		xfers[i]->flags = LIBUSB_TRANSFER_FREE_BUFFER;
+		libusb_set_iso_packet_lengths(xfers[i], cur_maxpkt);
+		r = libusb_submit_transfer(xfers[i]);
+		if (r < 0) {
+			event("iso submit: %s", libusb_error_name(r));
+			return -1;
+		}
+		active_xfers++;
+	}
+	pthread_mutex_lock(&h_mu);
+	h_bad_run = 0;
+	h_last_good = now() + START_GRACE;
+	pthread_mutex_unlock(&h_mu);
+	return 0;
+}
+
+static void run_test_faults(struct cam *c, double t)
+{
+	int i, r;
+
+	for (i = 0; i < n_tfaults; i++) {
+		if (tfaults[i].done || t - t_run0 < tfaults[i].at)
+			continue;
+		tfaults[i].done = 1;
+		switch (tfaults[i].kind) {
+		case TF_STALL:
+			event("TEST: dropping all iso data until the next restart");
+			sim_stall = 1;
+			break;
+		case TF_CORRUPT:
+			event("TEST: corrupting iso data for 4 seconds");
+			sim_corrupt_until = t + 4.0;
+			break;
+		case TF_RESET:
+			r = libusb_reset_device(c->h);
+			event("TEST: usb port reset of the camera -> %s",
+			      libusb_error_name(r));
+			if (r == LIBUSB_ERROR_NOT_FOUND && !fault)
+				fault = FAULT_GONE;
+			break;
+		case TF_BREAK:
+			event("TEST: breaking the camera's clock register");
+			if (c->drv->test_break)
+				c->drv->test_break(c);
+			break;
+		}
+	}
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -448,7 +822,9 @@ static void usage(void)
 		"                  [--device USBPATH] [--width 640|320] [--freq 0|50|60]\n"
 		"                  [--frames N] [--seconds S] [--alt N] [-v]\n"
 		"                  [--dump-packets N] [--reg HEX=HEX] [--i2c HEX=HEX]\n"
-		"       vintagecam --list\n");
+		"                  [--test-faults SEC:stall|corrupt|reset|break,...]\n"
+		"       vintagecam --list\n"
+		"       vintagecam --export FILE.mjpeg [--fps N] | ffmpeg ...\n");
 	exit(2);
 }
 
@@ -456,18 +832,13 @@ int main(int argc, char **argv)
 {
 	struct cam cam = { .width = 640, .light_freq = 0 };
 	struct cam *c = &cam;
-	struct libusb_transfer *xfers[N_XFERS] = {0};
-	struct libusb_config_descriptor *cfg = NULL;
-	struct found cams[16];
-	struct timeval wall;
-	libusb_context *ctx;
-	const struct libusb_interface *intf;
-	const char *rec_dir = NULL, *want_dev = NULL, *usbpath = "";
-	pthread_t writer_th, preview_th;
-	int have_writer = 0, have_preview_th = 0, want_preview = 0;
-	int alt = -1, maxpkt = 0, list = 0, r, i, n_cams, rc = 1;
-	double t_stat, t_poll, t0 = 0, t_end = 0;
-	long last_frames = 0;
+	const char *rec_dir = NULL, *export_path = NULL;
+	char dev_path[40] = "";
+	pthread_t sink_th, preview_th;
+	int have_sink = 0, have_preview_th = 0, want_preview = 0;
+	int want_alt = -1, list = 0, r, i, rc = 1, fails = 0;
+	double t_stat, t_poll, t_end, export_fps = 30;
+	long last_frames = 0, good_at_restart = 0;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--width") && i + 1 < argc)
@@ -479,19 +850,44 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
 			max_seconds = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--alt") && i + 1 < argc)
-			alt = atoi(argv[++i]);
+			want_alt = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--dump-packets") && i + 1 < argc)
 			dump_pkts = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--record") && i + 1 < argc)
 			rec_dir = argv[++i];
 		else if (!strcmp(argv[i], "--device") && i + 1 < argc)
-			want_dev = argv[++i];
+			snprintf(dev_path, sizeof dev_path, "%s", argv[++i]);
+		else if (!strcmp(argv[i], "--export") && i + 1 < argc)
+			export_path = argv[++i];
+		else if (!strcmp(argv[i], "--fps") && i + 1 < argc)
+			export_fps = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--preview"))
 			want_preview = 1;
 		else if (!strcmp(argv[i], "--stdout"))
 			use_stdout = 1;
-		else if ((!strcmp(argv[i], "--reg") || !strcmp(argv[i], "--i2c")) &&
-			 i + 1 < argc && c->n_pokes < 32) {
+		else if (!strcmp(argv[i], "--test-faults") && i + 1 < argc) {
+			char *s = argv[++i], *tok;
+
+			while ((tok = strsep(&s, ",")) && n_tfaults < 16) {
+				char kind[16];
+
+				if (sscanf(tok, "%lf:%15s", &tfaults[n_tfaults].at,
+					   kind) != 2)
+					usage();
+				if (!strcmp(kind, "stall"))
+					tfaults[n_tfaults].kind = TF_STALL;
+				else if (!strcmp(kind, "corrupt"))
+					tfaults[n_tfaults].kind = TF_CORRUPT;
+				else if (!strcmp(kind, "reset"))
+					tfaults[n_tfaults].kind = TF_RESET;
+				else if (!strcmp(kind, "break"))
+					tfaults[n_tfaults].kind = TF_BREAK;
+				else
+					usage();
+				n_tfaults++;
+			}
+		} else if ((!strcmp(argv[i], "--reg") || !strcmp(argv[i], "--i2c")) &&
+			   i + 1 < argc && c->n_pokes < 32) {
 			c->pokes[c->n_pokes].kind = argv[i][2] == 'r' ? 'r' : 'i';
 			if (sscanf(argv[++i], "%x=%x", &c->pokes[c->n_pokes].idx,
 				   &c->pokes[c->n_pokes].val) != 2)
@@ -505,219 +901,185 @@ int main(int argc, char **argv)
 			usage();
 	}
 
+	if (export_path)
+		return export_main(export_path, export_fps);
+
 	r = libusb_init(&ctx);
 	if (r < 0) {
 		fprintf(stderr, "libusb_init: %s\n", libusb_error_name(r));
 		return 1;
 	}
-	n_cams = find_cams(ctx, cams, 16);
 
 	if (list) {
-		for (i = 0; i < n_cams; i++)
+		struct found cams[16];
+		int n = find_cams(cams, 16);
+
+		for (i = 0; i < n; i++)
 			printf("%-10s %04x:%04x %s\n", cams[i].path,
 			       cams[i].drv->vid, cams[i].drv->pid,
 			       cams[i].drv->name);
-		if (!n_cams)
+		if (!n)
 			printf("no supported camera connected\n");
-		rc = 0;
-		goto out_ctx;
+		free_cams(cams, n);
+		libusb_exit(ctx);
+		return 0;
 	}
 
 	if (!rec_dir && !want_preview && !use_stdout) {
 		fprintf(stderr, "nothing to do with the frames: pass --preview, "
 			"--record DIR and/or --stdout\n");
-		rc = 2;
-		goto out_ctx;
+		libusb_exit(ctx);
+		return 2;
 	}
 	if (use_stdout && isatty(STDOUT_FILENO)) {
 		fprintf(stderr, "--stdout needs a pipe or a file, not a terminal\n");
-		rc = 2;
-		goto out_ctx;
-	}
-
-	for (i = 0; i < n_cams; i++)
-		if (!want_dev || !strcmp(want_dev, cams[i].path))
-			break;
-	if (i == n_cams) {
-		if (want_dev)
-			fprintf(stderr, "no supported camera at usb path %s (try --list)\n",
-				want_dev);
-		else
-			fprintf(stderr, "no supported camera found\n");
-		goto out_ctx;
-	}
-	if (!want_dev && n_cams > 1)
-		fprintf(stderr, "%d cameras connected, using %s (pick with --device)\n",
-			n_cams, cams[i].path);
-	c->drv = cams[i].drv;
-	usbpath = cams[i].path;
-	r = libusb_open(cams[i].dev, &c->h);
-	if (r < 0) {
-		fprintf(stderr, "open: %s\n", libusb_error_name(r));
-		goto out_ctx;
-	}
-	fprintf(stderr, "camera: %s (%04x:%04x) at usb %s\n", c->drv->name,
-		c->drv->vid, c->drv->pid, usbpath);
-
-	/* macos leaves vendor-class devices unconfigured */
-	r = libusb_get_configuration(c->h, &i);
-	if (r < 0 || i != 1) {
-		r = libusb_set_configuration(c->h, 1);
-		if (r < 0) {
-			fprintf(stderr, "set configuration: %s\n",
-				libusb_error_name(r));
-			goto out_close;
-		}
-	}
-	r = libusb_claim_interface(c->h, 0);
-	if (r < 0) {
-		fprintf(stderr, "claim interface: %s\n", libusb_error_name(r));
-		goto out_close;
-	}
-
-	r = libusb_get_config_descriptor(libusb_get_device(c->h), 0, &cfg);
-	if (r < 0) {
-		fprintf(stderr, "config descriptor: %s\n", libusb_error_name(r));
-		goto out_release;
-	}
-	intf = &cfg->interface[0];
-	if (alt < 0)
-		alt = intf->num_altsetting - 1;	/* biggest packets */
-	if (alt < 1 || alt >= intf->num_altsetting) {
-		fprintf(stderr, "bad alt %d (1..%d)\n", alt,
-			intf->num_altsetting - 1);
-		goto out_release;
-	}
-	for (i = 0; i < intf->altsetting[alt].bNumEndpoints; i++) {
-		const struct libusb_endpoint_descriptor *ep =
-			&intf->altsetting[alt].endpoint[i];
-
-		if (ep->bEndpointAddress == c->drv->iso_ep)
-			maxpkt = ep->wMaxPacketSize & 0x7ff;
-	}
-	if (maxpkt <= 0) {
-		fprintf(stderr, "iso endpoint %02x not found in alt %d\n",
-			c->drv->iso_ep, alt);
-		goto out_release;
+		libusb_exit(ctx);
+		return 2;
 	}
 
 	c->frame_cap = FRAME_CAP;
 	c->frame = malloc(c->frame_cap);
-	c->last_pkt = DISCARD_PACKET;
 	c->on_frame = on_frame;
-	if (!c->frame)
-		goto out_release;
-
-	if (c->drv->init(c) < 0) {
-		fprintf(stderr, "driver init failed\n");
-		goto out_release;
+	if (!c->frame || open_camera(c, dev_path, want_alt, 0) < 0) {
+		libusb_exit(ctx);
+		return 1;
 	}
+	want_w = c->width;
+	want_h = c->height;
+	fprintf(stderr, "camera: %s (%04x:%04x) at usb %s\n", c->drv->name,
+		c->drv->vid, c->drv->pid, dev_path);
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 
-	gettimeofday(&wall, NULL);
-	wall_minus_mono = wall.tv_sec + wall.tv_usec / 1e6 - now();
+	{
+		struct timeval wall;
 
-	if (rec_dir && start_record(rec_dir, c->drv->name, usbpath) < 0)
-		goto out_release;
-	use_queue = rec_dir || use_stdout;
-	if (use_queue) {
-		if (pthread_create(&writer_th, NULL, writer_main, NULL))
-			goto out_release;
-		have_writer = 1;
+		gettimeofday(&wall, NULL);
+		wall_minus_mono = wall.tv_sec + wall.tv_usec / 1e6 - now();
 	}
+
+	if (rec_dir && start_record(rec_dir, c->drv->name, dev_path) < 0)
+		goto out;
+	if (pthread_create(&sink_th, NULL, sink_main, NULL))
+		goto out;
+	have_sink = 1;
 	if (want_preview) {
 		char title[128];
 
-		snprintf(title, sizeof title, "%s usb %s", c->drv->name, usbpath);
+		snprintf(title, sizeof title, "%s usb %s", c->drv->name, dev_path);
 		if (start_preview(title) < 0 ||
 		    pthread_create(&preview_th, NULL, preview_main, NULL)) {
 			fprintf(stderr, "could not start preview\n");
-			goto out_threads;
+			goto out;
 		}
 		have_preview_th = 1;
 	}
 
-	r = libusb_set_interface_alt_setting(c->h, 0, alt);
-	if (r < 0) {
-		fprintf(stderr, "set alt %d: %s\n", alt, libusb_error_name(r));
-		goto out_threads;
-	}
-	if (c->drv->start(c) < 0) {
-		fprintf(stderr, "driver start failed\n");
-		goto out_alt0;
-	}
-	fprintf(stderr, "streaming %dx%d %s, alt %d (%d bytes/packet)\n",
-		c->width, c->height, c->drv->out_format, alt, maxpkt);
-	if (rec_dir)
-		fprintf(stderr, "recording to %s\n", rec_path);
+	t_run0 = t_stat = t_poll = now();
+	if (start_stream(c) < 0)
+		fault = FAULT_START;
+	else
+		event("streaming %dx%d %s, alt %d (%d bytes/packet)%s%s", c->width,
+		      c->height, c->drv->out_format, cur_alt, cur_maxpkt,
+		      rec_dir ? ", recording to " : "", rec_dir ? rec_path : "");
 
-	for (i = 0; i < N_XFERS; i++) {
-		u8 *buf = malloc((size_t)maxpkt * PKTS_PER_XFER);
-
-		xfers[i] = libusb_alloc_transfer(PKTS_PER_XFER);
-		if (!buf || !xfers[i])
-			goto out_cancel;
-		libusb_fill_iso_transfer(xfers[i], c->h, c->drv->iso_ep, buf,
-					 maxpkt * PKTS_PER_XFER, PKTS_PER_XFER,
-					 iso_cb, c, 1000);
-		libusb_set_iso_packet_lengths(xfers[i], maxpkt);
-		r = libusb_submit_transfer(xfers[i]);
-		if (r < 0) {
-			fprintf(stderr, "iso submit: %s\n", libusb_error_name(r));
-			goto out_cancel;
-		}
-		active_xfers++;
-	}
-
-	t0 = t_stat = t_poll = now();
-	while (!stopping && active_xfers > 0) {
+	while (!stopping) {
 		struct timeval tv = { 0, 50000 };
-		double t;
+		double t, last_good;
+		int bad_run, reopen;
+		long good;
 
-		libusb_handle_events_timeout(ctx, &tv);
-		t = now();
-		if (max_seconds > 0 && t - t0 >= max_seconds)
-			stopping = 1;
-		if (t - t_poll >= 0.1 && c->drv->poll && !stopping) {
-			t_poll = t;
-			c->drv->poll(c);
+		/* ---- normal running ---- */
+		if (!fault) {
+			libusb_handle_events_timeout(ctx, &tv);
+			t = now();
+			if (max_seconds > 0 && t - t_run0 >= max_seconds)
+				stopping = 1;
+			if (n_tfaults)
+				run_test_faults(c, t);
+			if (t - t_poll >= 0.1 && c->drv->poll && !stopping && !fault) {
+				t_poll = t;
+				c->drv->poll(c);
+				if (c->usb_err && !fault)
+					fault = FAULT_CTRL;
+			}
+			pthread_mutex_lock(&h_mu);
+			last_good = h_last_good;
+			bad_run = h_bad_run;
+			pthread_mutex_unlock(&h_mu);
+			if (!fault && bad_run >= BAD_RUN_LIMIT)
+				fault = FAULT_CORRUPT;
+			if (!fault && t - last_good > STALL_SECONDS)
+				fault = FAULT_STALL;
+			if (c->verbose && t - t_stat >= 1.0) {
+				fprintf(stderr,
+					"%.1f fps, %ld frames, %ld bad, %ld discarded, %ld iso errs, queue %zu KB, %ld restarts\n",
+					(n_frames - last_frames) / (t - t_stat),
+					n_frames, h_bad, n_discards, n_iso_errs,
+					q_bytes >> 10, n_restarts);
+				last_frames = n_frames;
+				t_stat = t;
+			}
+			continue;
 		}
-		if (c->verbose && t - t_stat >= 1.0) {
-			fprintf(stderr,
-				"%.1f fps, %ld frames, %ld discarded, %ld iso errs, queue %zu KB, %ld queue drops\n",
-				(n_frames - last_frames) / (t - t_stat),
-				n_frames, n_discards, n_iso_errs,
-				q_bytes >> 10, q_dropped);
-			last_frames = n_frames;
-			t_stat = t;
+
+		/* ---- recovery ---- */
+		pthread_mutex_lock(&h_mu);
+		good = h_good;
+		pthread_mutex_unlock(&h_mu);
+		/* did the last restart produce anything? if not, go harder */
+		fails = good > good_at_restart ? 0 : fails + 1;
+		good_at_restart = good;
+		reopen = fault == FAULT_GONE || fault == FAULT_START || fails >= 2 ||
+			 !c->h;
+		n_restarts++;
+		event("FAULT: %s. recovery #%ld: %s", fault_name[fault], n_restarts,
+		      reopen ? "reopening the device" : "restarting the stream");
+
+		stop_stream(c, fault != FAULT_GONE);
+		if (reopen) {
+			int waited = 0;
+
+			n_reopens++;
+			if (c->h && fails >= 3) {
+				r = libusb_reset_device(c->h);
+				event("usb port reset -> %s", libusb_error_name(r));
+			}
+			close_camera(c);
+			while (!stopping && open_camera(c, dev_path, want_alt, 1) < 0) {
+				if (!waited++)
+					event("waiting for the camera at usb %s", dev_path);
+				msleep(500);
+				if (max_seconds > 0 && now() - t_run0 >= max_seconds)
+					stopping = 1;
+			}
+			if (stopping)
+				break;
+			if (waited)
+				event("camera is back");
+		}
+		if (fails > 1)
+			msleep(fails > 10 ? 5000 : fails * 500);	/* don't thrash */
+		if (start_stream(c) < 0) {
+			stop_stream(c, 0);
+			fault = FAULT_START;
+		} else {
+			event("stream restarted");
 		}
 	}
-	rc = n_frames > 0 ? 0 : 1;
 
-out_cancel:
-	stopping = 1;
 	t_end = now();
-	for (i = 0; i < N_XFERS; i++)
-		if (xfers[i])
-			libusb_cancel_transfer(xfers[i]);
-	while (active_xfers > 0 && now() - t_end < 2.0) {
-		struct timeval tv = { 0, 50000 };
-
-		libusb_handle_events_timeout(ctx, &tv);
-	}
-out_alt0:
-	libusb_set_interface_alt_setting(c->h, 0, 0);
-	c->drv->stop(c);
-out_threads:
-	if (have_writer) {
+	stop_stream(c, 1);
+	rc = 0;
+out:
+	if (have_sink) {
 		pthread_mutex_lock(&q_mu);
 		q_done = 1;
 		pthread_cond_signal(&q_cv);
 		pthread_mutex_unlock(&q_mu);
-		pthread_join(writer_th, NULL);
+		pthread_join(sink_th, NULL);
 	}
 	if (have_preview_th) {
 		pthread_mutex_lock(&pv_mu);
@@ -736,38 +1098,41 @@ out_threads:
 		if (rec_idx && fclose(rec_idx) != 0)
 			rec_failed = 1;
 	}
+	if (bad_fd >= 0)
+		close(bad_fd);
 
-	if (t0 > 0) {
+	if (t_run0 > 0 && rc == 0) {
 		fprintf(stderr,
-			"%ld frames in %.1fs (%.1f fps), avg %ld bytes, %ld discarded, %ld iso errs\n",
-			n_frames, t_end - t0, n_frames / (t_end - t0),
-			n_frames ? n_frame_bytes / n_frames : 0, n_discards,
-			n_iso_errs);
+			"%ld frames in %.1fs (%.1f fps), avg %ld bytes: %ld good, %ld bad (dropped), "
+			"%ld incomplete, %ld iso packet errs, %ld transfer errs\n",
+			n_frames, t_end - t_run0, n_frames / (t_end - t_run0),
+			n_frames ? n_frame_bytes / n_frames : 0, h_good, h_bad,
+			n_discards, n_iso_errs, n_xfer_errs);
+		fprintf(stderr,
+			"camera frame counter skipped %ld, recoveries %ld (%ld with device reopen), "
+			"queue drops %ld, queue peak %zu KB\n",
+			h_cam_missed, n_restarts, n_reopens, q_dropped,
+			q_peak_bytes >> 10);
 		if (want_preview)
 			fprintf(stderr, "preview: %ld frames shown\n", pv_shown);
-	}
-	if (rec_dir && rec_path[0]) {
-		fprintf(stderr,
-			"recorded %ld of %ld frames to %s (queue drops %ld, queue peak %zu KB)%s\n",
-			rec_written, n_frames, rec_path, q_dropped,
-			q_peak_bytes >> 10, rec_failed ? " WRITE ERRORS" : "");
-		if (rec_written > 1)
-			fprintf(stderr,
-				"to mkv: ffmpeg -f mjpeg -framerate %.3f -i %s -c copy %s.mkv\n",
-				(rec_written - 1) / (rec_t_last - rec_t_first),
-				rec_path, rec_path);
-		if (rec_failed || q_dropped || rec_written != n_frames)
+		if (h_good == 0)
 			rc = 1;
 	}
-out_release:
-	if (cfg)
-		libusb_free_config_descriptor(cfg);
-	libusb_release_interface(c->h, 0);
-out_close:
-	libusb_close(c->h);
-out_ctx:
-	for (i = 0; i < n_cams; i++)
-		libusb_unref_device(cams[i].dev);
+	if (rec_dir && rec_path[0]) {
+		fprintf(stderr, "recorded %ld of %ld good frames to %s%s\n",
+			rec_written, h_good, rec_path,
+			rec_failed ? " WRITE ERRORS" : "");
+		if (rec_written > 1)
+			fprintf(stderr,
+				"to mkv: ./vintagecam --export %s --fps 30 | "
+				"ffmpeg -f mjpeg -framerate 30 -i - -c copy %s.mkv\n",
+				rec_path, rec_path);
+		if (rec_failed || q_dropped || rec_written != h_good)
+			rc = 1;
+	}
+	if (ev_file)
+		fclose(ev_file);
+	close_camera(c);
 	libusb_exit(ctx);
 	return rc;
 }

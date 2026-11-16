@@ -1,1 +1,2 @@
 -I/opt/homebrew/Cellar/libusb/1.0.30/include/libusb-1.0
+-I/opt/homebrew/opt/jpeg-turbo/include
