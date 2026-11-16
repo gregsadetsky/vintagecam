@@ -25,6 +25,7 @@ static int active_xfers;
 static long n_frames, n_frame_bytes, n_iso_errs, n_discards, n_pkts;
 static long max_frames = -1;
 static int dump_pkts;
+static double max_seconds;
 
 static void on_signal(int sig)
 {
@@ -45,6 +46,20 @@ static double now(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt)
+{
+	int i;
+
+	for (i = 0; i < c->n_pokes; i++)
+		if (c->pokes[i].kind == kind && c->pokes[i].idx == idx) {
+			fprintf(stderr, "poke %s %04x: %02x -> %02x\n",
+				kind == 'r' ? "reg" : "i2c", idx, dflt,
+				c->pokes[i].val);
+			return c->pokes[i].val;
+		}
+	return dflt;
 }
 
 /* same contract as gspca_frame_add() */
@@ -147,15 +162,16 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer *t)
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: vintagecam [--width 320|640] [--freq 0|50|60] [--frames N]\n"
-		"                  [--alt N] [--dump-packets N] [-v] > out\n"
+		"usage: vintagecam [--width 320|640] [--freq 0|50|60] [--frames N] [--seconds S]\n"
+		"                  [--alt N] [--dump-packets N] [-v]\n"
+		"                  [--reg HEXIDX=HEXVAL] [--i2c HEXREG=HEXVAL] > out\n"
 		"       vintagecam --list\n");
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	struct cam cam = { .width = 320, .light_freq = 0 };
+	struct cam cam = { .width = 640, .light_freq = 0 };
 	struct cam *c = &cam;
 	struct libusb_transfer *xfers[N_XFERS] = {0};
 	struct libusb_config_descriptor *cfg = NULL;
@@ -173,11 +189,20 @@ int main(int argc, char **argv)
 			c->light_freq = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--frames") && i + 1 < argc)
 			max_frames = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
+			max_seconds = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--alt") && i + 1 < argc)
 			alt = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--dump-packets") && i + 1 < argc)
 			dump_pkts = atoi(argv[++i]);
-		else if (!strcmp(argv[i], "--list"))
+		else if ((!strcmp(argv[i], "--reg") || !strcmp(argv[i], "--i2c")) &&
+			 i + 1 < argc && c->n_pokes < 32) {
+			c->pokes[c->n_pokes].kind = argv[i][2] == 'r' ? 'r' : 'i';
+			if (sscanf(argv[++i], "%x=%x", &c->pokes[c->n_pokes].idx,
+				   &c->pokes[c->n_pokes].val) != 2)
+				usage();
+			c->n_pokes++;
+		} else if (!strcmp(argv[i], "--list"))
 			list = 1;
 		else if (!strcmp(argv[i], "-v"))
 			c->verbose = 1;
@@ -319,6 +344,8 @@ int main(int argc, char **argv)
 
 		libusb_handle_events_timeout(ctx, &tv);
 		t = now();
+		if (max_seconds > 0 && t - t0 >= max_seconds)
+			stopping = 1;
 		if (t - t_poll >= 0.1 && c->drv->poll && !stopping) {
 			t_poll = t;
 			c->drv->poll(c);

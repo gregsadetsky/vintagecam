@@ -109,13 +109,16 @@ static void usb_exchange(struct cam *c, const struct usb_action *action)
 	while (action->req) {
 		switch (action->req) {
 		case 0xa0:	/* write register */
-			reg_w(c, action->val, action->idx);
+			reg_w(c, poke_lookup(c, 'r', action->idx, action->val),
+			      action->idx);
 			break;
 		case 0xa1:	/* read status */
 			reg_r(c, action->idx);
 			break;
 		case 0xaa:
-			i2c_write(c, action->val, action->idx & 0xff,
+			i2c_write(c, action->val,
+				  poke_lookup(c, 'i', action->val,
+					      action->idx & 0xff),
 				  action->idx >> 8);
 			break;
 		case 0xbb:

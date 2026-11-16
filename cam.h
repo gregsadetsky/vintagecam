@@ -37,6 +37,11 @@ struct cam {
 	int width, height;
 	int light_freq;		/* 0, 50, 60 */
 
+	/* debug: override values the driver's init tables write.
+	 * kind 'r' bridge register, 'i' sensor i2c register */
+	struct { char kind; unsigned idx, val; } pokes[32];
+	int n_pokes;
+
 	/* frame assembly */
 	u8 *frame;
 	int frame_len, frame_cap;
@@ -48,6 +53,7 @@ struct cam {
 
 void frame_add(struct cam *c, enum pkt_type type, const u8 *data, int len);
 void msleep(int ms);
+int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt);
 
 extern const struct cam_driver zc3xx_gc0303_driver;
 
