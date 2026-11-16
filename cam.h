@@ -22,6 +22,7 @@ struct cam_driver {
 	const char *name;
 	u16 vid, pid;
 	u16 bcd;		/* device version to match, 0 = any */
+	u16 alt_vid, alt_pid;	/* a second id the same camera was seen with, 0 = none */
 	u8 iso_ep;
 	const char *out_format;	/* what a finished frame is, e.g. "mjpeg" */
 	enum bayer bayer;	/* not NONE: frames are raw, the engine makes jpegs */

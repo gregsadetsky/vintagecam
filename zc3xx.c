@@ -516,6 +516,12 @@ const struct cam_driver zc3xx_pas106_driver = {
 	.name = "creative-webcam-nx-zc3xx-pas106",
 	.vid = 0x041e,
 	.pid = 0x401c,
+	/* a real pd1110 came back from a replug as ff1e:ffff (those bytes of
+	 * its device descriptor read 0xff, also after a port reset) while its
+	 * endpoints and bridge worked normally. the sensor probe in init still
+	 * has to read a pas106 before anything is streamed. */
+	.alt_vid = 0xff1e,
+	.alt_pid = 0xffff,
 	.iso_ep = 0x81,
 	.out_format = "mjpeg",
 	.init = zc3xx_init,

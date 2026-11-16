@@ -670,8 +670,11 @@ static int find_cams(struct found *out, int max)
 		if (libusb_get_device_descriptor(list[i], &dd) < 0)
 			continue;
 		for (d = 0; d < N_DRIVERS; d++)
-			if (drivers[d]->vid == dd.idVendor &&
-			    drivers[d]->pid == dd.idProduct &&
+			if (((drivers[d]->vid == dd.idVendor &&
+			      drivers[d]->pid == dd.idProduct) ||
+			     (drivers[d]->alt_vid &&
+			      drivers[d]->alt_vid == dd.idVendor &&
+			      drivers[d]->alt_pid == dd.idProduct)) &&
 			    (!drivers[d]->bcd || drivers[d]->bcd == dd.bcdDevice))
 				break;
 		if (d == N_DRIVERS)
