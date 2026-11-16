@@ -368,6 +368,11 @@ static int stv06xx_init(struct cam *c)
 			sd->vv6410 ? 32768 : 511, sd->gain_max);
 		return -1;
 	}
+	/* not in the kernel: a recorder that died without stopping the stream
+	 * leaves the bridge streaming, and then sensor access times out on
+	 * every later start (seen on the quickcam after a kill -9). */
+	write_bridge(c, STV_ISO_ENABLE, 0);
+
 	if (sd->vv6410)
 		return vv6410_init(c);
 

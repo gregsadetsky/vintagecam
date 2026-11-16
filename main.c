@@ -62,6 +62,16 @@ static const char *fault_name[] = { "none", "no good frames", "bad frame run",
 static volatile sig_atomic_t stopping;
 static libusb_context *ctx;
 static struct libusb_transfer *xfers[N_XFERS];
+/* per transfer state. a transfer that did not come back in time is marked
+ * abandoned and frees itself whenever it does return. counting alone was not
+ * enough: late returns made the count wrong, the next drain freed transfers
+ * still in flight, and the recorder crashed at exit (seen after a real stall). */
+struct xctx {
+	struct cam *c;
+	int in_flight, abandoned;
+};
+static struct xctx *xctxs[N_XFERS];
+static int abandoned_out;
 static int active_xfers, stream_halt, stream_gen;
 static enum fault fault;
 static int cur_alt = -1, cur_maxpkt;
@@ -118,7 +128,8 @@ static volatile sig_atomic_t pv_dead;
 static long pv_shown;
 
 /* ---- test hooks (--test-faults) ---- */
-enum { TF_STALL, TF_CORRUPT, TF_RESET, TF_BREAK };
+enum { TF_STALL, TF_CORRUPT, TF_RESET, TF_BREAK, TF_ABANDON };
+static int test_abandon;
 static struct { double at; int kind, done; } tfaults[16];
 static int n_tfaults;
 static int sim_stall;
@@ -565,14 +576,22 @@ static int start_record(const char *dir, const char *name, const char *usbpath)
 
 static void LIBUSB_CALL iso_cb(struct libusb_transfer *t)
 {
-	struct cam *c = t->user_data;
+	struct xctx *x = t->user_data;
+	struct cam *c = x->c;
 	double t_done = now();
 	int i;
 
+	if (x->abandoned) {
+		libusb_free_transfer(t);	/* frees its buffer too */
+		free(x);
+		abandoned_out--;
+		return;
+	}
 	if (t->status == LIBUSB_TRANSFER_CANCELLED ||
 	    t->status == LIBUSB_TRANSFER_NO_DEVICE) {
 		if (t->status == LIBUSB_TRANSFER_NO_DEVICE && !fault)
 			fault = FAULT_GONE;
+		x->in_flight = 0;
 		active_xfers--;
 		return;
 	}
@@ -618,8 +637,10 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer *t)
 	}
 resubmit:
 	if (stream_halt || stopping) {
+		x->in_flight = 0;
 		active_xfers--;
 	} else if (libusb_submit_transfer(t) < 0) {
+		x->in_flight = 0;
 		active_xfers--;
 		if (!fault)
 			fault = FAULT_SUBMIT;
@@ -678,8 +699,16 @@ static void free_cams(struct found *cams, int n)
 
 static void close_camera(struct cam *c)
 {
+	double t = now();
+
 	if (!c->h)
 		return;
+	/* let abandoned transfers come home before their device is closed */
+	while (abandoned_out > 0 && now() - t < 1.0) {
+		struct timeval tv = { 0, 50000 };
+
+		libusb_handle_events_timeout(ctx, &tv);
+	}
 	libusb_release_interface(c->h, 0);
 	libusb_close(c->h);
 	c->h = NULL;
@@ -820,25 +849,30 @@ static void drain_xfers(void)
 	double t = now();
 	int i;
 
-	while (active_xfers > 0 && now() - t < 2.0) {
+	while (active_xfers > 0 && now() - t < (test_abandon ? 0.0 : 2.0)) {
 		struct timeval tv = { 0, 50000 };
 
 		libusb_handle_events_timeout(ctx, &tv);
 	}
 	if (active_xfers > 0) {
-		/* something never completed: leak rather than free in-flight */
 		event("%d iso transfers never returned, abandoning them",
 		      active_xfers);
-		active_xfers = 0;
-		for (i = 0; i < N_XFERS; i++)
-			xfers[i] = NULL;
-		return;
+		test_abandon = 0;
 	}
 	for (i = 0; i < N_XFERS; i++) {
-		if (xfers[i])
-			libusb_free_transfer(xfers[i]);	/* frees its buffer too */
+		if (xfers[i] && xctxs[i] && xctxs[i]->in_flight) {
+			/* never free one in flight: it frees itself on return */
+			xctxs[i]->abandoned = 1;
+			abandoned_out++;
+		} else {
+			if (xfers[i])
+				libusb_free_transfer(xfers[i]);	/* and its buffer */
+			free(xctxs[i]);
+		}
 		xfers[i] = NULL;
+		xctxs[i] = NULL;
 	}
+	active_xfers = 0;
 }
 
 static void stop_stream(struct cam *c, int device_ok)
@@ -882,11 +916,13 @@ static int start_stream(struct cam *c)
 		u8 *buf = malloc((size_t)cur_maxpkt * PKTS_PER_XFER);
 
 		xfers[i] = libusb_alloc_transfer(PKTS_PER_XFER);
-		if (!buf || !xfers[i])
+		xctxs[i] = calloc(1, sizeof *xctxs[i]);
+		if (!buf || !xfers[i] || !xctxs[i])
 			return -1;
+		xctxs[i]->c = c;
 		libusb_fill_iso_transfer(xfers[i], c->h, c->drv->iso_ep, buf,
 					 cur_maxpkt * PKTS_PER_XFER,
-					 PKTS_PER_XFER, iso_cb, c, 1000);
+					 PKTS_PER_XFER, iso_cb, xctxs[i], 1000);
 		xfers[i]->flags = LIBUSB_TRANSFER_FREE_BUFFER;
 		libusb_set_iso_packet_lengths(xfers[i], cur_maxpkt);
 		r = libusb_submit_transfer(xfers[i]);
@@ -894,6 +930,7 @@ static int start_stream(struct cam *c)
 			event("iso submit: %s", libusb_error_name(r));
 			return -1;
 		}
+		xctxs[i]->in_flight = 1;
 		active_xfers++;
 	}
 	pthread_mutex_lock(&h_mu);
@@ -927,6 +964,11 @@ static void run_test_faults(struct cam *c, double t)
 			if (r == LIBUSB_ERROR_NOT_FOUND && !fault)
 				fault = FAULT_GONE;
 			break;
+		case TF_ABANDON:
+			event("TEST: stall, and do not wait for cancelled transfers");
+			sim_stall = 1;
+			test_abandon = 1;
+			break;
 		case TF_BREAK:
 			event("TEST: breaking the camera's clock register");
 			if (c->drv->test_break)
@@ -944,7 +986,7 @@ static void usage(void)
 		"                  [--frames N] [--seconds S] [--alt N] [-v]\n"
 		"                  [--dump-packets N] [--reg HEX=HEX] [--i2c HEX=HEX]\n"
 		"                  [--bayer grbg|rggb|bggr|gbrg] [--exposure N] [--gain N]\n"
-		"                  [--test-faults SEC:stall|corrupt|reset|break,...]\n"
+		"                  [--test-faults SEC:stall|corrupt|reset|break|abandon,...]\n"
 		"       vintagecam --list\n"
 		"       vintagecam --export FILE.mjpeg [--fps N] | ffmpeg ...\n");
 	exit(2);
@@ -1019,6 +1061,8 @@ int main(int argc, char **argv)
 					tfaults[n_tfaults].kind = TF_RESET;
 				else if (!strcmp(kind, "break"))
 					tfaults[n_tfaults].kind = TF_BREAK;
+				else if (!strcmp(kind, "abandon"))
+					tfaults[n_tfaults].kind = TF_ABANDON;
 				else
 					usage();
 				n_tfaults++;
