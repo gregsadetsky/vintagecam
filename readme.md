@@ -4,7 +4,7 @@ userspace libusb drivers for pre-uvc usb webcams on macos. one binary, picks
 the driver by usb vid:pid, writes finished frames to stdout.
 
 ```sh
-brew install libusb ffmpeg
+brew install libusb ffmpeg jpeg-turbo
 make
 make view                          # preview window only
 make record                        # record to recordings/ with a preview window
@@ -16,14 +16,40 @@ make record ARGS="--width 320"     # 320x240, about twice the frame rate
 one process drives one camera. run one per camera, picked with `--device`
 (the usb path from `--list`, stable for a given physical port).
 
-- `--record DIR` writes every frame, in the camera's own jpeg bytes, to
-  `DIR/<time>-<camera>-usb<path>.mjpeg` plus a `.csv` index (frame number,
-  seconds since first frame, unix time, byte offset, size). writing happens on
-  its own thread. it never overwrites a file. the summary at the end says how
-  many frames were captured vs written and prints an ffmpeg line to make an mkv.
+- `--record DIR` writes every good frame, in the camera's own jpeg bytes, to
+  `DIR/<time>-<camera>-usb<path>.mjpeg`. next to it: `.csv` (frame number,
+  seconds since first frame, unix time, byte offset, size, camera frame
+  counter), `.events.csv` (faults and recoveries) and `.bad` (up to 200
+  rejected frames, for a post mortem). it never overwrites a file.
 - `--preview` opens an ffplay window fed only the latest frame, so it can lag
   or be closed without touching the recording.
 - `--stdout` writes the raw frame stream to a pipe.
+
+## when things go wrong
+
+every frame is fully decoded (turbojpeg) before it is written. a frame that
+does not decode cleanly at the expected size is dropped, never recorded.
+the main loop restarts things when there has been no good frame for 2s, 20
+bad frames in a row, a usb control or iso error, or the device vanished:
+first the stream, then (if that produced nothing) close and reopen the
+device, then a usb port reset, and it keeps waiting for the camera to come
+back on the same usb port for as long as it takes. the recording file stays
+open the whole time, so an outage is a gap in the index, not a broken file.
+
+`--export` turns a recording into constant frame rate video in real time,
+with black frames wherever there was a gap over 0.5s:
+
+```sh
+./vintagecam --export rec.mjpeg --fps 30 | ffmpeg -f mjpeg -framerate 30 -i - -c copy rec.mkv
+```
+
+`--test-faults 8:break,20:stall,32:corrupt,48:reset` triggers faults at those
+seconds: `break` writes a register that makes the camera send garbage,
+`stall` drops all incoming data, `corrupt` damages incoming data for 4s,
+`reset` does a usb port reset under the running stream.
+
+what it cannot catch: a picture that is a valid jpeg but looks wrong (bad
+colors, frozen, black).
 
 other flags: `--width 640|320` (default 640), `--freq 0|50|60` (mains flicker
 table, 0 = none), `--frames N`, `--seconds S`, `--alt N` (usb bandwidth
@@ -59,6 +85,5 @@ frame headers against what the kernel source says.
 - macos leaves these devices unconfigured, so the engine sets configuration 1
   before claiming the interface.
 - `gspca/` holds headers and tables copied from the linux kernel, hence gpl.
-- not done yet: syphon output, raw (non jpeg) cameras, exact per frame timing in
-  the mkv (the index has it, the ffmpeg line uses the average rate), snapshot button (interrupt ep 0x82), controls
+- not done yet: syphon output, raw (non jpeg) cameras, snapshot button (interrupt ep 0x82), controls
   for brightness/contrast/gamma/sharpness.

@@ -609,17 +609,39 @@ static void close_camera(struct cam *c)
 
 /* open the camera at usb path `path` ("" = first one found, and remember
  * where it was), configure, claim, pick the alt setting, run driver init.
- * quiet = 1 while polling for a camera that went away. */
+ * quiet = 1 while polling for a camera that went away. in that mode, if
+ * nothing is at the old path and exactly one camera of the same model is
+ * connected, follow it to its new port. with two or more of the same model
+ * there is no telling them apart (no serial numbers), so keep waiting. */
 static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 {
+	static int twins_warned;
 	struct found cams[16];
 	struct libusb_config_descriptor *cfg = NULL;
 	const struct libusb_interface *intf;
 	int n = find_cams(cams, 16), i, r, cfgval, alt, maxpkt = 0;
+	char moved_from[40] = "", new_path[40] = "";
 
 	for (i = 0; i < n; i++)
 		if (!path[0] || !strcmp(path, cams[i].path))
 			break;
+	if (i == n && quiet && c->drv) {
+		int same = 0, k, at = -1;
+
+		for (k = 0; k < n; k++)
+			if (cams[k].drv == c->drv) {
+				same++;
+				at = k;
+			}
+		if (same == 1) {
+			i = at;
+			snprintf(moved_from, sizeof moved_from, "%s", path);
+		} else if (same > 1 && !twins_warned) {
+			twins_warned = 1;
+			event("%d cameras of this model connected, none at usb %s: "
+			      "not guessing which one is mine", same, path);
+		}
+	}
 	if (i == n) {
 		if (!quiet) {
 			if (path[0])
@@ -634,8 +656,10 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 		fprintf(stderr, "%d cameras connected, using %s (pick with --device)\n",
 			n, cams[i].path);
 	c->drv = cams[i].drv;
-	snprintf(path, 40, "%s", cams[i].path);
 	r = libusb_open(cams[i].dev, &c->h);
+	if (r >= 0 && !moved_from[0])
+		snprintf(path, 40, "%s", cams[i].path);
+	snprintf(new_path, sizeof new_path, "%s", cams[i].path);
 	free_cams(cams, n);
 	if (r < 0) {
 		if (!quiet)
@@ -686,6 +710,11 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 			fprintf(stderr, "driver init failed\n");
 		goto fail;
 	}
+	if (moved_from[0]) {
+		snprintf(path, 40, "%s", new_path);
+		event("camera moved from usb %s to usb %s", moved_from, path);
+	}
+	twins_warned = 0;
 	return 0;
 fail:
 	if (cfg)
