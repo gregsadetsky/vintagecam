@@ -1,10 +1,31 @@
 #!/bin/sh
 # one recorder per connected camera, plus one grid window showing all of them.
 # closing the grid window (or ctrl-c) stops every recorder cleanly.
+# a recorder that dies (it has crashed inside libusb when started while a
+# camera was resetting) is started again, up to 5 times, into a new file.
 # usage: ./wall.sh [DIR]     recordings go to DIR (default: recordings)
 cd "$(dirname "$0")" || exit 1
 dir=${1:-recordings}
 mkdir -p "$dir" || exit 1
+
+supervise() {
+	path=$1
+	log="$dir/recorder-usb$path.log"
+	child=""
+	trap '[ -n "$child" ] && kill -TERM $child 2>/dev/null; wait; exit 0' TERM INT
+	tries=0
+	while [ $tries -le 5 ]; do
+		./vintagecam --device "$path" --record "$dir" 2>>"$log" &
+		child=$!
+		wait $child
+		rc=$?
+		[ $rc -eq 0 ] && exit 0
+		tries=$((tries + 1))
+		echo "wall: recorder for usb $path exited with $rc, start $tries of 5 again" >>"$log"
+		sleep 1
+	done
+}
+
 pids=""
 n=0
 stop() {
@@ -14,7 +35,7 @@ stop() {
 trap stop EXIT
 trap 'exit 0' INT TERM
 for path in $(./vintagecam --list | awk '$2 ~ /:/ {print $1}'); do
-	./vintagecam --device "$path" --record "$dir" 2>"$dir/recorder-usb$path.log" &
+	supervise "$path" &
 	pids="$pids $!"
 	n=$((n + 1))
 done

@@ -129,8 +129,13 @@ static volatile sig_atomic_t pv_dead;
 static long pv_shown;
 
 /* ---- test hooks (--test-faults) ---- */
-enum { TF_STALL, TF_CORRUPT, TF_RESET, TF_BREAK, TF_ABANDON };
+enum { TF_STALL, TF_CORRUPT, TF_RESET, TF_BREAK, TF_ABANDON, TF_HIDE };
 static int test_abandon;
+/* TF_HIDE: pretend my camera is unplugged for a while (it is skipped when
+ * looking for cameras), to exercise the waiting logic without a human */
+static char *my_path;
+static char hide_path[40];
+static double hide_until;
 static struct { double at; int kind, done; } tfaults[16];
 static int n_tfaults;
 static int sim_stall;
@@ -679,7 +684,6 @@ static int find_cams(struct found *out, int max)
 				break;
 		if (d == N_DRIVERS)
 			continue;
-		out[n].dev = libusb_ref_device(list[i]);
 		out[n].drv = drivers[d];
 		off = snprintf(out[n].path, sizeof out[n].path, "%d",
 			       libusb_get_bus_number(list[i]));
@@ -688,6 +692,10 @@ static int find_cams(struct found *out, int max)
 			off += snprintf(out[n].path + off,
 					sizeof out[n].path - off, "%c%d",
 					k ? '.' : '-', ports[k]);
+		if (hide_path[0] && now() < hide_until &&
+		    !strcmp(hide_path, out[n].path))
+			continue;
+		out[n].dev = libusb_ref_device(list[i]);
 		n++;
 	}
 	if (cnt >= 0)
@@ -720,15 +728,38 @@ static void close_camera(struct cam *c)
 	c->priv = NULL;
 }
 
+/* can this camera be claimed right now? one that another recorder holds
+ * cannot. an unconfigured one counts as free: nobody is using it. the
+ * attempt does not disturb a recorder that holds it (seen: a busy ibm kept
+ * recording through thousands of these). */
+static int is_free(libusb_device *dev)
+{
+	libusb_device_handle *h;
+	int cfgval = 0, ok = 0;
+
+	if (libusb_open(dev, &h) < 0)
+		return 0;
+	if (libusb_get_configuration(h, &cfgval) < 0 || cfgval != 1) {
+		ok = 1;
+	} else if (libusb_claim_interface(h, 0) >= 0) {
+		libusb_release_interface(h, 0);
+		ok = 1;
+	}
+	libusb_close(h);
+	return ok;
+}
+
 /* open the camera at usb path `path` ("" = first one found, and remember
  * where it was), configure, claim, pick the alt setting, run driver init.
  * quiet = 1 while polling for a camera that went away. in that mode, if
  * nothing is at the old path and exactly one camera of the same model is
- * connected, follow it to its new port. with two or more of the same model
- * there is no telling them apart (no serial numbers), so keep waiting. */
+ * that no other recorder is using is connected, follow it to its new port.
+ * with two or more free ones of the same model there is no telling them
+ * apart (no serial numbers), so keep waiting.
+ * returns 0, -2 when no matching camera is connected, -1 for other failures. */
 static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 {
-	static int twins_warned;
+	static int twins_warned, busy_warned;
 	struct found cams[16];
 	struct libusb_config_descriptor *cfg = NULL;
 	const struct libusb_interface *intf;
@@ -743,7 +774,7 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 			break;
 	if (i == n && quiet && c->drv) {
 		static int stranger_warned;
-		int same = 0, k, at = -1;
+		int same = 0, nfree = 0, k, at = -1;
 
 		for (k = 0; k < n; k++)
 			if (!strcmp(path, cams[k].path) && !stranger_warned) {
@@ -755,15 +786,23 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 		for (k = 0; k < n; k++)
 			if (cams[k].drv == c->drv) {
 				same++;
-				at = k;
+				if (is_free(cams[k].dev)) {
+					nfree++;
+					at = k;
+				}
 			}
-		if (same == 1) {
+		if (nfree == 1) {
 			i = at;
 			snprintf(moved_from, sizeof moved_from, "%s", path);
-		} else if (same > 1 && !twins_warned) {
+		} else if (nfree > 1 && !twins_warned) {
 			twins_warned = 1;
-			event("%d cameras of this model connected, none at usb %s: "
-			      "not guessing which one is mine", same, path);
+			event("%d free cameras of this model connected, none at usb %s: "
+			      "not guessing which one is mine", nfree, path);
+		} else if (nfree == 0 && same > 0 && !busy_warned) {
+			busy_warned = 1;
+			event("%d other camera%s of this model connected but in use by "
+			      "another recorder, still waiting for mine at usb %s",
+			      same, same > 1 ? "s" : "", path);
 		}
 	}
 	if (i == n) {
@@ -774,7 +813,7 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 				fprintf(stderr, "no supported camera found\n");
 		}
 		free_cams(cams, n);
-		return -1;
+		return -2;
 	}
 	if (!path[0] && n > 1)
 		fprintf(stderr, "%d cameras connected, using %s (pick with --device)\n",
@@ -839,7 +878,7 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 		snprintf(path, 40, "%s", new_path);
 		event("camera moved from usb %s to usb %s", moved_from, path);
 	}
-	twins_warned = 0;
+	twins_warned = busy_warned = 0;
 	return 0;
 fail:
 	if (cfg)
@@ -968,6 +1007,13 @@ static void run_test_faults(struct cam *c, double t)
 			if (r == LIBUSB_ERROR_NOT_FOUND && !fault)
 				fault = FAULT_GONE;
 			break;
+		case TF_HIDE:
+			event("TEST: pretending the camera is unplugged for 12 seconds");
+			snprintf(hide_path, sizeof hide_path, "%s", my_path);
+			hide_until = t + 12.0;
+			if (!fault)
+				fault = FAULT_GONE;
+			break;
 		case TF_ABANDON:
 			event("TEST: stall, and do not wait for cancelled transfers");
 			sim_stall = 1;
@@ -990,7 +1036,7 @@ static void usage(void)
 		"                  [--frames N] [--seconds S] [--alt N] [-v]\n"
 		"                  [--dump-packets N] [--reg HEX=HEX] [--i2c HEX=HEX]\n"
 		"                  [--bayer grbg|rggb|bggr|gbrg] [--exposure N] [--gain N]\n"
-		"                  [--test-faults SEC:stall|corrupt|reset|break|abandon,...]\n"
+		"                  [--test-faults SEC:stall|corrupt|reset|break|abandon|hide,...]\n"
 		"       vintagecam --list\n"
 		"       vintagecam --export FILE.mjpeg [--fps N] | ffmpeg ...\n");
 	exit(2);
@@ -1067,6 +1113,8 @@ int main(int argc, char **argv)
 					tfaults[n_tfaults].kind = TF_BREAK;
 				else if (!strcmp(kind, "abandon"))
 					tfaults[n_tfaults].kind = TF_ABANDON;
+				else if (!strcmp(kind, "hide"))
+					tfaults[n_tfaults].kind = TF_HIDE;
 				else
 					usage();
 				n_tfaults++;
@@ -1125,7 +1173,21 @@ int main(int argc, char **argv)
 	c->frame_cap = FRAME_CAP;
 	c->frame = malloc(c->frame_cap);
 	c->on_frame = on_frame;
-	if (!c->frame || open_camera(c, dev_path, want_alt, 0) < 0) {
+	my_path = dev_path;
+	/* a camera that was plugged in (or reset) a moment ago can refuse the
+	 * first open: seen as "configure/claim: LIBUSB_ERROR_NO_DEVICE" on a
+	 * camera that then opened fine. try a few times before giving up. */
+	for (i = 0; c->frame; i++) {
+		r = open_camera(c, dev_path, want_alt, 0);
+		/* with --device, "not there" gets the same patience: a camera
+		 * being reset drops off the bus for a moment (seen) */
+		if (r == 0 || (r == -2 && !dev_path[0]) || i >= 5)
+			break;
+		fprintf(stderr, "could not open the camera, trying again (%d of 5)\n",
+			i + 1);
+		msleep(700);
+	}
+	if (!c->frame || r < 0) {
 		libusb_exit(ctx);
 		return 1;
 	}
