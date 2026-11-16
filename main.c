@@ -698,8 +698,11 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 	int n = find_cams(cams, 16), i, r, cfgval, alt, maxpkt = 0;
 	char moved_from[40] = "", new_path[40] = "";
 
+	/* when coming back (quiet), a camera of another model sitting on my old
+	 * port is not mine: seen for real when two cameras swapped ports */
 	for (i = 0; i < n; i++)
-		if (!path[0] || !strcmp(path, cams[i].path))
+		if ((!path[0] || !strcmp(path, cams[i].path)) &&
+		    (!quiet || !c->drv || cams[i].drv == c->drv))
 			break;
 	if (i == n && quiet && c->drv) {
 		int same = 0, k, at = -1;
