@@ -1,14 +1,14 @@
 # vintagecam
 
 userspace libusb drivers for pre-uvc usb webcams on macos. one binary, picks
-the driver by usb vid:pid, writes finished frames to stdout.
+the driver by usb vid:pid, records and previews jpeg frames.
 
 ```sh
 brew install libusb ffmpeg jpeg-turbo
 make
 make view                          # preview window only
 make record                        # record to recordings/ with a preview window
-make record ARGS="--width 320"     # 320x240, about twice the frame rate
+make record ARGS="--width 320"     # vf0250: 320x240, about twice the frame rate
 ./vintagecam --list                # connected supported cameras and their usb path
 ./vintagecam --record DIR --preview --device 2-1.4
 ```
@@ -16,8 +16,10 @@ make record ARGS="--width 320"     # 320x240, about twice the frame rate
 one process drives one camera. run one per camera, picked with `--device`
 (the usb path from `--list`, stable for a given physical port).
 
-- `--record DIR` writes every good frame, in the camera's own jpeg bytes, to
-  `DIR/<time>-<camera>-usb<path>.mjpeg`. next to it: `.csv` (frame number,
+- `--record DIR` writes every good frame to
+  `DIR/<time>-<camera>-usb<path>.mjpeg`: the camera's own jpeg bytes if it
+  sends jpeg, otherwise (raw bayer cameras) demosaiced and encoded here at
+  quality 95, 4:4:4. next to it: `.csv` (frame number,
   seconds since first frame, unix time, byte offset, size, camera frame
   counter), `.events.csv` (faults and recoveries) and `.bad` (up to 200
   rejected frames, for a post mortem). it never overwrites a file.
@@ -27,8 +29,9 @@ one process drives one camera. run one per camera, picked with `--device`
 
 ## when things go wrong
 
-every frame is fully decoded (turbojpeg) before it is written. a frame that
-does not decode cleanly at the expected size is dropped, never recorded.
+every jpeg frame is fully decoded (turbojpeg) before it is written. a frame
+that does not decode cleanly at the expected size is dropped, never recorded.
+raw frames can only be checked for their exact byte count.
 the main loop restarts things when there has been no good frame for 2s, 20
 bad frames in a row, a usb control or iso error, or the device vanished:
 first the stream, then (if that produced nothing) close and reopen the
@@ -51,8 +54,10 @@ seconds: `break` writes a register that makes the camera send garbage,
 what it cannot catch: a picture that is a valid jpeg but looks wrong (bad
 colors, frozen, black).
 
-other flags: `--width 640|320` (default 640), `--freq 0|50|60` (mains flicker
-table, 0 = none), `--frames N`, `--seconds S`, `--alt N` (usb bandwidth
+other flags: `--width N` (see the cameras table, first size is the default),
+`--exposure N` / `--gain N` (fixed values instead of auto, quickcam only so
+far), `--bayer grbg|rggb|bggr|gbrg` (override the raw layout), `--freq 0|50|60`
+(mains flicker table, 0 = none, vf0250 only), `--frames N`, `--seconds S`, `--alt N` (usb bandwidth
 reservation, see notes), `--dump-packets N`, `-v` (stats on stderr),
 `--reg HEX=HEX` / `--i2c HEX=HEX` (override a value the init table writes to a
 bridge / sensor register, or write an extra one, for experiments).
@@ -62,6 +67,7 @@ bridge / sensor register, or write an extra one, for experiments).
 | camera | usb id | chips | status |
 | --- | --- | --- | --- |
 | creative vf0250 | 041e:4051 | zc3xx bridge + gc0303 sensor | works, mjpeg, 640x480 ~14 fps and 320x240 ~28 fps |
+| logitech quickcam express | 046d:0840 | stv0600 bridge + pb0100 sensor | works, raw bayer, 320x240 ~10 fps and 352x288 ~8 fps. units with an hdcs sensor: not ported |
 
 ## adding a camera
 
@@ -81,9 +87,17 @@ frame headers against what the kernel source says.
   the vf0250). measured on the vf0250, 6s runs: 320x240 keeps its full 28 fps
   down to `--alt 4` (384 bytes/ms) and 27.6 fps at `--alt 3` (256); 640x480
   needs alt 7 for 14 fps (alt 5 gives 11, alt 4 gives 8.5, below that nothing).
-  smaller reservations should let more cameras share a bus (untested, one camera so far).
+  smaller reservations should let more cameras share a bus (untested: the two
+  cameras so far ran together fine, but on different buses).
+- quickcam express: the sensor's own auto exposure stayed near white for every
+  target tried (why: unexplained), so the driver runs its own: it nudges the
+  row integration time, then the gain, toward a mean raw value of 105.
+  integration time above about 0xf0 lowers the frame rate, so it stops there.
+  no white balance yet, the picture is a little green. its one alt setting
+  reserves 1023 bytes/ms, which is most of a full speed bus.
 - macos leaves these devices unconfigured, so the engine sets configuration 1
   before claiming the interface.
 - `gspca/` holds headers and tables copied from the linux kernel, hence gpl.
-- not done yet: syphon output, raw (non jpeg) cameras, snapshot button (interrupt ep 0x82), controls
+- not done yet: syphon output, white balance for raw cameras, keeping the raw
+  bayer bytes, snapshot button (interrupt ep 0x82), controls
   for brightness/contrast/gamma/sharpness.

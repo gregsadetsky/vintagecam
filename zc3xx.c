@@ -259,6 +259,8 @@ static int zc3xx_init(struct cam *c)
 	c->priv = sd;
 	sd->reg08 = REG08_DEF;
 
+	if (c->width == 0)
+		c->width = 640;
 	if (c->width != 640 && c->width != 320) {
 		fprintf(stderr, "zc3xx: width must be 320 or 640\n");
 		return -1;

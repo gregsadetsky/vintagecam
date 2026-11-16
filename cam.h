@@ -13,6 +13,9 @@ typedef int32_t s32;
 
 enum pkt_type { DISCARD_PACKET, FIRST_PACKET, INTER_PACKET, LAST_PACKET };
 
+/* raw 8 bit bayer layouts, named by the first two rows like v4l2 does */
+enum bayer { BAYER_NONE, BAYER_GRBG, BAYER_RGGB, BAYER_BGGR, BAYER_GBRG };
+
 struct cam;
 
 struct cam_driver {
@@ -20,6 +23,7 @@ struct cam_driver {
 	u16 vid, pid;
 	u8 iso_ep;
 	const char *out_format;	/* what a finished frame is, e.g. "mjpeg" */
+	enum bayer bayer;	/* not NONE: frames are raw, the engine makes jpegs */
 	int (*init)(struct cam *c);	/* once after claim */
 	int (*start)(struct cam *c);	/* after set alt, before iso submit */
 	void (*poll)(struct cam *c);	/* about every 100ms while streaming */
@@ -36,8 +40,10 @@ struct cam {
 	int verbose;
 
 	/* options */
-	int width, height;
+	int width, height;	/* width 0 = the driver's default */
 	int light_freq;		/* 0, 50, 60 */
+	int exposure, gain;	/* -1 = the driver decides (auto if it can) */
+	int iso_maxpkt;		/* packet size of the chosen alt setting */
 
 	/* debug: override values the driver's init tables write.
 	 * kind 'r' bridge register, 'i' sensor i2c register */
@@ -59,6 +65,7 @@ void msleep(int ms);
 int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt);
 
 extern const struct cam_driver zc3xx_gc0303_driver;
+extern const struct cam_driver stv06xx_pb0100_driver;
 
 int export_main(const char *mjpeg_path, double fps);
 

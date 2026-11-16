@@ -46,6 +46,7 @@
 
 static const struct cam_driver *drivers[] = {
 	&zc3xx_gc0303_driver,
+	&stv06xx_pb0100_driver,
 };
 #define N_DRIVERS (sizeof drivers / sizeof drivers[0])
 
@@ -100,6 +101,7 @@ static int rec_failed;
 static double rec_t_first = -1, rec_t_last;
 static double wall_minus_mono;
 static int want_w, want_h;
+static enum bayer want_bayer;
 static pthread_mutex_t ev_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- lossy preview: one slot holding the latest frame ---- */
@@ -275,6 +277,45 @@ static const char *frame_problem(tjhandle tj, u8 *scratch, const u8 *d, int len)
 	return NULL;
 }
 
+/* bilinear demosaic of 8 bit bayer to rgb. a missing colour is the mean of
+ * the sites of that colour among the 8 neighbours. */
+static void bayer_to_rgb(const u8 *in, u8 *out, int w, int h, enum bayer pat)
+{
+	/* colour (0 r, 1 g, 2 b) at [row parity * 2 + column parity] */
+	static const u8 sites[5][4] = {
+		{ 1, 1, 1, 1 },
+		{ 1, 0, 2, 1 },		/* GRBG */
+		{ 0, 1, 1, 2 },		/* RGGB */
+		{ 2, 1, 1, 0 },		/* BGGR */
+		{ 1, 2, 0, 1 },		/* GBRG */
+	};
+	const u8 *site = sites[pat];
+	int x, y, dx, dy;
+
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			int sum[3] = { 0, 0, 0 }, cnt[3] = { 0, 0, 0 };
+			int own = site[(y & 1) * 2 + (x & 1)], ch;
+
+			for (dy = -1; dy <= 1; dy++) {
+				for (dx = -1; dx <= 1; dx++) {
+					int xx = x + dx, yy = y + dy;
+
+					if (xx < 0 || yy < 0 || xx >= w || yy >= h)
+						continue;
+					ch = site[(yy & 1) * 2 + (xx & 1)];
+					sum[ch] += in[yy * w + xx];
+					cnt[ch]++;
+				}
+			}
+			for (ch = 0; ch < 3; ch++)
+				out[ch] = ch == own ? in[y * w + x] :
+					  cnt[ch] ? sum[ch] / cnt[ch] : 0;
+			out += 3;
+		}
+	}
+}
+
 static void preview_push(const u8 *data, int len)
 {
 	if (pv_fd < 0 || pv_dead || len > FRAME_CAP)
@@ -289,8 +330,11 @@ static void preview_push(const u8 *data, int len)
 
 static void *sink_main(void *arg)
 {
-	tjhandle tj = tjInitDecompress();
+	tjhandle tj = tjInitDecompress(), tjc = tjInitCompress();
 	u8 *scratch = malloc((size_t)want_w * want_h);
+	u8 *rgb = malloc((size_t)want_w * want_h * 3);
+	unsigned long jpg_cap = tjBufSize(want_w, want_h, TJSAMP_444);
+	u8 *jpg = malloc(jpg_cap);
 	long long offset = 0;
 	int gen = -1, prev_seq = -1;
 
@@ -298,6 +342,8 @@ static void *sink_main(void *arg)
 	for (;;) {
 		struct qframe *f;
 		const char *why;
+		const u8 *out;
+		int out_len;
 
 		pthread_mutex_lock(&q_mu);
 		while (!q_head && !q_done)
@@ -313,8 +359,32 @@ static void *sink_main(void *arg)
 		if (!f)
 			break;
 
-		why = (tj && scratch) ? frame_problem(tj, scratch, f->data, f->len)
-				      : "no decoder";
+		out = f->data;
+		out_len = f->len;
+		if (!tj || !tjc || !scratch || !rgb || !jpg) {
+			why = "no decoder";
+		} else if (want_bayer) {
+			/* a raw frame has nothing to check but its size */
+			unsigned long n = jpg_cap;
+			u8 *dst = jpg;
+
+			if (f->len != want_w * want_h) {
+				why = "wrong raw frame size";
+			} else {
+				bayer_to_rgb(f->data, rgb, want_w, want_h, want_bayer);
+				if (tjCompress2(tjc, rgb, want_w, 0, want_h, TJPF_RGB,
+						&dst, &n, TJSAMP_444, 95,
+						TJFLAG_NOREALLOC)) {
+					why = tjGetErrorStr2(tjc);
+				} else {
+					why = NULL;
+					out = jpg;
+					out_len = (int)n;
+				}
+			}
+		} else {
+			why = frame_problem(tj, scratch, f->data, f->len);
+		}
 
 		pthread_mutex_lock(&h_mu);
 		if (f->gen != gen) {		/* stream was restarted */
@@ -353,7 +423,7 @@ static void *sink_main(void *arg)
 		}
 
 		if (rec_fd >= 0 && !rec_failed) {
-			if (write_all(rec_fd, f->data, f->len) < 0) {
+			if (write_all(rec_fd, out, out_len) < 0) {
 				rec_failed = 1;
 				event("RECORD WRITE FAILED: %s", strerror(errno));
 				stopping = 1;
@@ -363,26 +433,30 @@ static void *sink_main(void *arg)
 				rec_t_last = f->t;
 				fprintf(rec_idx, "%ld,%.6f,%.6f,%lld,%d,%d\n",
 					rec_written, f->t - rec_t_first,
-					f->t + wall_minus_mono, offset, f->len,
+					f->t + wall_minus_mono, offset, out_len,
 					f->cam_seq);
 				fflush(rec_idx);	/* a hard kill loses no rows */
-				offset += f->len;
+				offset += out_len;
 				rec_written++;
 			}
 		}
-		if (use_stdout && write_all(STDOUT_FILENO, f->data, f->len) < 0) {
+		if (use_stdout && write_all(STDOUT_FILENO, out, out_len) < 0) {
 			use_stdout = 0;		/* reader went away */
 			if (rec_fd < 0)
 				stopping = 1;
 		}
-		preview_push(f->data, f->len);
+		preview_push(out, out_len);
 		if (max_frames > 0 && h_good >= max_frames)
 			stopping = 1;
 		free(f);
 	}
 	free(scratch);
+	free(rgb);
+	free(jpg);
 	if (tj)
 		tjDestroy(tj);
+	if (tjc)
+		tjDestroy(tjc);
 	return NULL;
 }
 
@@ -705,6 +779,7 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 	}
 	cur_alt = alt;
 	cur_maxpkt = maxpkt;
+	c->iso_maxpkt = maxpkt;
 
 	c->usb_err = 0;
 	if (c->drv->init(c) < 0) {
@@ -850,9 +925,10 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: vintagecam [--record DIR] [--preview] [--stdout]\n"
-		"                  [--device USBPATH] [--width 640|320] [--freq 0|50|60]\n"
+		"                  [--device USBPATH] [--width N] [--freq 0|50|60]\n"
 		"                  [--frames N] [--seconds S] [--alt N] [-v]\n"
 		"                  [--dump-packets N] [--reg HEX=HEX] [--i2c HEX=HEX]\n"
+		"                  [--bayer grbg|rggb|bggr|gbrg] [--exposure N] [--gain N]\n"
 		"                  [--test-faults SEC:stall|corrupt|reset|break,...]\n"
 		"       vintagecam --list\n"
 		"       vintagecam --export FILE.mjpeg [--fps N] | ffmpeg ...\n");
@@ -861,7 +937,8 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-	struct cam cam = { .width = 640, .light_freq = 0 };
+	struct cam cam = { .width = 0, .light_freq = 0, .exposure = -1, .gain = -1 };
+	enum bayer bayer_override = BAYER_NONE;
 	struct cam *c = &cam;
 	const char *rec_dir = NULL, *export_path = NULL;
 	char dev_path[40] = "";
@@ -876,6 +953,10 @@ int main(int argc, char **argv)
 			c->width = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--freq") && i + 1 < argc)
 			c->light_freq = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--exposure") && i + 1 < argc)
+			c->exposure = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--gain") && i + 1 < argc)
+			c->gain = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--frames") && i + 1 < argc)
 			max_frames = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
@@ -892,7 +973,17 @@ int main(int argc, char **argv)
 			export_path = argv[++i];
 		else if (!strcmp(argv[i], "--fps") && i + 1 < argc)
 			export_fps = atof(argv[++i]);
-		else if (!strcmp(argv[i], "--preview"))
+		else if (!strcmp(argv[i], "--bayer") && i + 1 < argc) {
+			static const char *names[] = { "", "grbg", "rggb", "bggr", "gbrg" };
+			int k;
+
+			i++;
+			for (k = 1; k < 5; k++)
+				if (!strcmp(argv[i], names[k]))
+					bayer_override = k;
+			if (!bayer_override)
+				usage();
+		} else if (!strcmp(argv[i], "--preview"))
 			want_preview = 1;
 		else if (!strcmp(argv[i], "--stdout"))
 			use_stdout = 1;
@@ -977,6 +1068,9 @@ int main(int argc, char **argv)
 	}
 	want_w = c->width;
 	want_h = c->height;
+	want_bayer = c->drv->bayer;
+	if (want_bayer && bayer_override)
+		want_bayer = bayer_override;
 	fprintf(stderr, "camera: %s (%04x:%04x) at usb %s\n", c->drv->name,
 		c->drv->vid, c->drv->pid, dev_path);
 

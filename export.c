@@ -105,7 +105,7 @@ int export_main(const char *path, double fps)
 	zero = calloc((size_t)w * h, 3);
 	tj = tjInitCompress();
 	if (!zero || tjCompress2(tj, zero, w, 0, h, TJPF_RGB, &black, &black_len,
-				 TJSAMP_422, 75, 0)) {
+				 sub, 75, 0)) {
 		fprintf(stderr, "cannot make black frame\n");
 		return 1;
 	}
