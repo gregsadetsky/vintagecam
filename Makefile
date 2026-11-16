@@ -2,8 +2,19 @@ CFLAGS ?= -O2 -Wall -Wextra
 CFLAGS += $(shell pkg-config --cflags libusb-1.0 libturbojpeg)
 LDLIBS += $(shell pkg-config --libs libusb-1.0 libturbojpeg)
 
-vintagecam: main.c export.c zc3xx.c stv06xx.c xirlink-cit.c cam.h gspca/jpeg.h gspca/zc3xx-reg.h gspca/zc3xx-gc0303.h gspca/zc3xx-pas106b.h
-	$(CC) $(CFLAGS) -o $@ main.c export.c zc3xx.c stv06xx.c xirlink-cit.c $(LDLIBS) -lpthread
+vintagecam: main.c export.c zc3xx.c stv06xx.c xirlink-cit.c ov519.c cam.h gspca/jpeg.h gspca/zc3xx-reg.h gspca/zc3xx-gc0303.h gspca/zc3xx-pas106b.h
+	$(CC) $(CFLAGS) -o $@ main.c export.c zc3xx.c stv06xx.c xirlink-cit.c ov519.c $(LDLIBS) -lpthread
+
+# one window with the latest frame of every recording growing in a folder
+vintagegrid: grid.c
+	$(CC) $(CFLAGS) -o $@ grid.c $(shell pkg-config --libs libturbojpeg)
+
+grid: vintagegrid
+	./vintagegrid recordings $(ARGS)
+
+# record every connected camera and show them all in one window
+wall: vintagecam vintagegrid
+	./wall.sh recordings
 
 # live preview only
 view: vintagecam
@@ -14,6 +25,6 @@ record: vintagecam
 	./vintagecam --record recordings --preview $(ARGS)
 
 clean:
-	rm -f vintagecam
+	rm -f vintagecam vintagegrid
 
-.PHONY: view record clean
+.PHONY: view record grid wall clean

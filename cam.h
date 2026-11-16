@@ -70,6 +70,7 @@ extern const struct cam_driver stv06xx_pb0100_driver;
 extern const struct cam_driver zc3xx_pas106_driver;
 extern const struct cam_driver xirlink_cit_model2_driver;
 extern const struct cam_driver stv06xx_vv6410_driver;
+extern const struct cam_driver ov519_ov7648_driver;
 
 int export_main(const char *mjpeg_path, double fps);
 

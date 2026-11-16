@@ -50,6 +50,7 @@ static const struct cam_driver *drivers[] = {
 	&zc3xx_pas106_driver,
 	&xirlink_cit_model2_driver,
 	&stv06xx_vv6410_driver,
+	&ov519_ov7648_driver,
 };
 #define N_DRIVERS (sizeof drivers / sizeof drivers[0])
 
