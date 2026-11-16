@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * z-star/vimicro zc3xx bridge + gc0303 sensor (creative 041e:4051).
+ * z-star/vimicro zc3xx bridge with a gc0303 sensor (creative 041e:4051) or a
+ * pas106 sensor (creative webcam nx, model pd1110, 041e:401c).
  * ported from linux drivers/media/usb/gspca/zc3xx.c
  *   Copyright (C) 2009-2012 Jean-Francois Moine
  *   Copyright (C) 2004 2005 2006 Michel Xhaard
- * only the SENSOR_GC0303 paths are kept. the kernel line each block comes
+ * only the SENSOR_GC0303 and SENSOR_PAS106 paths are kept. the kernel line each block comes
  * from is named in the comments (function names, not line numbers).
  */
 #include <stdio.h>
@@ -24,8 +25,10 @@ struct usb_action {
 };
 
 #include "gspca/zc3xx-gc0303.h"
+#include "gspca/zc3xx-pas106b.h"
 
 struct sd {
+	int pas106;	/* 0: gc0303 */
 	u8 reg08;
 	u8 reg07;	/* bit rate control state (transfer_update) */
 	int good;
@@ -138,8 +141,11 @@ static void setmatrix(struct cam *c)
 {
 	static const u8 gc0303_matrix[9] =
 		{0x6c, 0xea, 0xea, 0xea, 0x6c, 0xea, 0xea, 0xea, 0x6c};
+	struct sd *sd = c->priv;
 	int i;
 
+	if (sd->pas106)
+		return;		/* matrix_tb[SENSOR_PAS106] = NULL: already loaded */
 	for (i = 0; i < 9; i++)
 		reg_w(c, gc0303_matrix[i], 0x010a + i);
 }
@@ -218,8 +224,15 @@ static void setcontrast(struct cam *c, s32 gamma, s32 brightness, s32 contrast)
 
 static void setlightfreq(struct cam *c, int scale)
 {
+	struct sd *sd = c->priv;
 	const struct usb_action *t;
 
+	if (sd->pas106) {	/* same tables for both sizes */
+		usb_exchange(c, c->light_freq == 50 ? pas106b_50HZ :
+				c->light_freq == 60 ? pas106b_60HZ :
+				pas106b_NoFlicker);
+		return;
+	}
 	switch (c->light_freq) {
 	case 50:
 		t = scale ? gc0303_50HZScale : gc0303_50HZ;
@@ -248,6 +261,57 @@ static u16 probe_gc0303(struct cam *c)
 	return i2c_read(c, 0x00);
 }
 
+/* send_unknown(SENSOR_PAS106) */
+static void pas106_send_unknown(struct cam *c)
+{
+	reg_w(c, 0x01, 0x0000);		/* bridge reset */
+	reg_w(c, 0x03, 0x003a);
+	reg_w(c, 0x0c, 0x003b);
+	reg_w(c, 0x08, 0x0038);
+}
+
+/* sd_config + sd_init, pas106 path (sif_probe) */
+static int pas106_init(struct cam *c)
+{
+	u16 checkword;
+
+	if (c->width == 0)
+		c->width = 352;
+	if (c->width == 352) {
+		c->height = 288;
+	} else if (c->width == 176) {
+		c->height = 144;
+	} else {
+		fprintf(stderr, "zc3xx: width must be 352 or 176\n");
+		return -1;
+	}
+
+	/* start_2wr_probe(0x0f) */
+	reg_w(c, 0x01, 0x0000);
+	reg_w(c, 0x0f, 0x0010);
+	reg_w(c, 0x01, 0x0001);
+	reg_w(c, 0x03, 0x0012);
+	reg_w(c, 0x01, 0x0012);
+	reg_w(c, 0x08, 0x008d);
+	msleep(150);
+	checkword = ((i2c_read(c, 0x00) & 0x0f) << 4)
+			| ((i2c_read(c, 0x01) & 0xf0) >> 4);
+	fprintf(stderr, "zc3xx: sif probe read 0x%04x (pas106 = 0x0007)\n",
+		checkword);
+	if (c->usb_err < 0)
+		return -1;
+	if (checkword != 0x0007) {
+		fprintf(stderr, "zc3xx: not a pas106, other sensors on this id "
+			"are not ported\n");
+		return -1;
+	}
+	pas106_send_unknown(c);
+
+	reg_r(c, 0x0010);
+	reg_w(c, 0x01, 0x0000);		/* switch off the led */
+	return c->usb_err;
+}
+
 /* sd_config + sd_init, gc0303 path */
 static int zc3xx_init(struct cam *c)
 {
@@ -258,6 +322,9 @@ static int zc3xx_init(struct cam *c)
 		return -1;
 	c->priv = sd;
 	sd->reg08 = REG08_DEF;
+	sd->pas106 = c->drv == &zc3xx_pas106_driver;
+	if (sd->pas106)
+		return pas106_init(c);
 
 	if (c->width == 0)
 		c->width = 640;
@@ -276,20 +343,25 @@ static int zc3xx_init(struct cam *c)
 	return c->usb_err;
 }
 
-/* sd_start, gc0303 path */
+/* sd_start, gc0303 and pas106 paths */
 static int zc3xx_start(struct cam *c)
 {
 	struct sd *sd = c->priv;
-	int scale = c->width == 320;
+	int scale = c->width == 320 || c->width == 176;
 
 	jpeg_define(sd->jpeg_hdr, c->height, c->width, 0x21);	/* JPEG 422 */
 
-	usb_exchange(c, scale ? gc0303_InitialScale : gc0303_Initial);
+	if (sd->pas106) {
+		usb_exchange(c, pas106b_Initial_com);
+		usb_exchange(c, scale ? pas106b_InitialScale : pas106b_Initial);
+	} else {
+		usb_exchange(c, scale ? gc0303_InitialScale : gc0303_Initial);
+	}
 
 	/* not in the kernel: with the table's 0x17 = 0xe8 the 320x240 picture
 	 * has green swapped with red/blue (checked on ntsc bars: out G =
 	 * avg(R, B), out R = B = G). 0xe9 gives the right bar order. */
-	if (scale)
+	if (scale && !sd->pas106)
 		i2c_write(c, 0x17, poke_lookup(c, 'i', 0x17, 0xe9), 0x00);
 
 	/* debug pokes for registers the table never writes */
@@ -305,16 +377,19 @@ static int zc3xx_start(struct cam *c)
 			reg_w(c, c->pokes[i].val, c->pokes[i].idx);
 	}
 
-	reg_r(c, 0x0002);		/* --> 0x40 */
-	reg_w(c, 0x09, 0x01ad);		/* (from win traces) */
-	reg_w(c, 0x15, 0x01ae);
-	reg_w(c, 0x0d, 0x003a);
-	reg_w(c, 0x02, 0x003b);
-	reg_w(c, 0x00, 0x0038);
+	if (!sd->pas106) {
+		reg_r(c, 0x0002);		/* --> 0x40 */
+		reg_w(c, 0x09, 0x01ad);		/* (from win traces) */
+		reg_w(c, 0x15, 0x01ae);
+		reg_w(c, 0x0d, 0x003a);
+		reg_w(c, 0x02, 0x003b);
+		reg_w(c, 0x00, 0x0038);
+	}
 
 	setmatrix(c);
 	setsharpness(c, 2);
-	setcontrast(c, 3, 128, 128);	/* gamma[SENSOR_GC0303] = 3 */
+	/* gamma[SENSOR_GC0303] = 3, gamma[SENSOR_PAS106] = 4 */
+	setcontrast(c, sd->pas106 ? 4 : 3, 128, 128);
 	setmatrix(c);			/* one more time? */
 
 	/* setquality */
@@ -375,8 +450,13 @@ static void zc3xx_poll(struct cam *c)
 /* sd_stop0 -> send_unknown(), gc0303 has no extra writes */
 static void zc3xx_stop(struct cam *c)
 {
+	struct sd *sd = c->priv;
+
 	c->usb_err = 0;
-	reg_w(c, 0x01, 0x0000);		/* bridge reset */
+	if (sd && sd->pas106)
+		pas106_send_unknown(c);
+	else
+		reg_w(c, 0x01, 0x0000);		/* bridge reset */
 }
 
 static void zc3xx_pkt_scan(struct cam *c, const u8 *data, int len)
@@ -422,6 +502,20 @@ const struct cam_driver zc3xx_gc0303_driver = {
 	.name = "creative-vf0250-zc3xx-gc0303",
 	.vid = 0x041e,
 	.pid = 0x4051,
+	.iso_ep = 0x81,
+	.out_format = "mjpeg",
+	.init = zc3xx_init,
+	.start = zc3xx_start,
+	.poll = zc3xx_poll,
+	.stop = zc3xx_stop,
+	.pkt_scan = zc3xx_pkt_scan,
+	.test_break = zc3xx_test_break,
+};
+
+const struct cam_driver zc3xx_pas106_driver = {
+	.name = "creative-webcam-nx-zc3xx-pas106",
+	.vid = 0x041e,
+	.pid = 0x401c,
 	.iso_ep = 0x81,
 	.out_format = "mjpeg",
 	.init = zc3xx_init,

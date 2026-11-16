@@ -47,6 +47,9 @@
 static const struct cam_driver *drivers[] = {
 	&zc3xx_gc0303_driver,
 	&stv06xx_pb0100_driver,
+	&zc3xx_pas106_driver,
+	&xirlink_cit_model2_driver,
+	&stv06xx_vv6410_driver,
 };
 #define N_DRIVERS (sizeof drivers / sizeof drivers[0])
 
@@ -646,7 +649,8 @@ static int find_cams(struct found *out, int max)
 			continue;
 		for (d = 0; d < N_DRIVERS; d++)
 			if (drivers[d]->vid == dd.idVendor &&
-			    drivers[d]->pid == dd.idProduct)
+			    drivers[d]->pid == dd.idProduct &&
+			    (!drivers[d]->bcd || drivers[d]->bcd == dd.bcdDevice))
 				break;
 		if (d == N_DRIVERS)
 			continue;
@@ -705,7 +709,15 @@ static int open_camera(struct cam *c, char *path, int want_alt, int quiet)
 		    (!quiet || !c->drv || cams[i].drv == c->drv))
 			break;
 	if (i == n && quiet && c->drv) {
+		static int stranger_warned;
 		int same = 0, k, at = -1;
+
+		for (k = 0; k < n; k++)
+			if (!strcmp(path, cams[k].path) && !stranger_warned) {
+				stranger_warned = 1;
+				event("a different camera (%s) is on usb %s, leaving it alone",
+				      cams[k].drv->name, path);
+			}
 
 		for (k = 0; k < n; k++)
 			if (cams[k].drv == c->drv) {

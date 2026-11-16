@@ -21,6 +21,7 @@ struct cam;
 struct cam_driver {
 	const char *name;
 	u16 vid, pid;
+	u16 bcd;		/* device version to match, 0 = any */
 	u8 iso_ep;
 	const char *out_format;	/* what a finished frame is, e.g. "mjpeg" */
 	enum bayer bayer;	/* not NONE: frames are raw, the engine makes jpegs */
@@ -66,6 +67,9 @@ int poke_lookup(struct cam *c, char kind, unsigned idx, int dflt);
 
 extern const struct cam_driver zc3xx_gc0303_driver;
 extern const struct cam_driver stv06xx_pb0100_driver;
+extern const struct cam_driver zc3xx_pas106_driver;
+extern const struct cam_driver xirlink_cit_model2_driver;
+extern const struct cam_driver stv06xx_vv6410_driver;
 
 int export_main(const char *mjpeg_path, double fps);
 
