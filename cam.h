@@ -43,7 +43,7 @@ struct cam {
 
 	/* options */
 	int width, height;	/* width 0 = the driver's default */
-	int light_freq;		/* 0, 50, 60 */
+	int light_freq;		/* 0, 50, 60, or -1: not given, the driver picks */
 	int exposure, gain;	/* -1 = the driver decides (auto if it can) */
 	int iso_maxpkt;		/* packet size of the chosen alt setting */
 

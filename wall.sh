@@ -1,10 +1,14 @@
 #!/bin/sh
-# one recorder per connected camera, plus one grid window showing all of them.
+# one recorder per connected camera, plus one grid window showing all of them
+# and a local stream of each camera for obs (http://127.0.0.1:8090/).
 # closing the grid window (or ctrl-c) stops every recorder cleanly.
 # a recorder that dies (it has crashed inside libusb when started while a
 # camera was resetting) is started again, up to 5 times, into a new file.
-# usage: ./wall.sh [DIR]     recordings go to DIR (default: recordings)
+# usage: ./wall.sh [--no-grid] [DIR]   recordings go to DIR (default: recordings)
+# --no-grid: no window, just recorders and the streams, until ctrl-c (for obs)
 cd "$(dirname "$0")" || exit 1
+grid=1
+[ "$1" = "--no-grid" ] && { grid=0; shift; }
 dir=${1:-recordings}
 mkdir -p "$dir" || exit 1
 
@@ -40,9 +44,16 @@ for path in $(./vintagecam --list | awk '$2 ~ /:/ {print $1}'); do
 	n=$((n + 1))
 done
 [ -n "$pids" ] || { echo "no supported camera connected"; exit 1; }
+./vintageserve "$dir" &
+pids="$pids $!"
 # grid shape for the number of cameras: 3x2 up to 6, 4x2 up to 8, then 4x3, 4x4
 cols=3 rows=2
 [ $n -gt 6 ] && cols=4
 [ $n -gt 8 ] && rows=3
 [ $n -gt 12 ] && rows=4
-./vintagegrid "$dir" --cols $cols --rows $rows
+if [ $grid -eq 1 ]; then
+	./vintagegrid "$dir" --cols $cols --rows $rows
+else
+	echo "streaming $n camera(s) at http://127.0.0.1:8090/ (ctrl-c stops everything)"
+	wait
+fi

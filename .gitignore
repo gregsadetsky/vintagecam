@@ -1,6 +1,7 @@
 # build output
 vintagecam
 vintagegrid
+vintageserve
 *.o
 *.dSYM/
 

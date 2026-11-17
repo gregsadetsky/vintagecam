@@ -14,13 +14,14 @@ make
 make view                   # preview window for the first camera
 make record                 # record it to recordings/, with a preview window
 make wall                   # record every camera, one window showing all of them
+make streams                # record every camera and stream each one locally, for obs
 ```
 
 ## cameras
 
 | camera | usb id | chips | modes (measured) |
 | --- | --- | --- | --- |
-| creative vf0250 | 041e:4051 | zc3xx + gc0303 | 640x480 ~14 fps, 320x240 ~28 fps, jpeg |
+| creative vf0250 | 041e:4051 | zc3xx + gc0303 | 640x480 ~14 fps, 320x240 ~28 fps in good light, ~9 fps in a dim room, jpeg |
 | creative webcam nx (pd1110) | 041e:401c | zc3xx + pas106 | 352x288, ~9 to 37 fps depending on the scene, jpeg. 176x144 written, never run |
 | logitech quickcam express | 046d:0840 | stv0600 + pb0100 | 320x240 ~10 fps, 352x288 ~8 fps, raw bayer |
 | lego camera / quickcam web | 046d:0850 | stv0610 + vv6410 | 356x292 ~8 fps, raw bayer |
@@ -52,6 +53,24 @@ growing in the folder. the grid only reads the files, so it cannot disturb a
 recorder. a tile goes dim when its camera has sent nothing for 2s. closing the
 grid stops all recorders. a recorder that dies is started again, up to 5 times.
 
+## obs
+
+`vintageserve DIR` gives every camera being recorded into DIR a live mjpeg
+stream on this machine only (it binds to 127.0.0.1). `make wall` and
+`make streams` start it.
+
+- http://127.0.0.1:8090/ lists the cameras
+- in obs: add a Browser source, url `http://127.0.0.1:8090/cam/NAME`, width
+  640, height 480. one source per camera.
+- a name keeps working across restarts, and a second camera of the same model
+  is `NAME-2`.
+
+`node obs-scene.mjs` is meant to build an obs scene with all cameras in a grid
+over obs's websocket server (tools > websocket server settings). it has not
+been run against obs yet.
+
+## export
+
 `--export` turns a recording into constant frame rate video in real time. a
 skipped frame repeats the previous one, a gap over 0.5s becomes black:
 
@@ -82,7 +101,7 @@ what it cannot catch: a picture that is valid but looks wrong.
 
 `--width N`, `--exposure N` / `--gain N` (fixed values where the driver has
 its own auto exposure: quickcam, lego, ibm), `--freq 0|50|60` (mains flicker,
-zc3xx and eyetoy), `--bayer grbg|rggb|bggr|gbrg`, `--alt N` (usb bandwidth
+zc3xx and eyetoy. the vf0250 defaults to 60, the others to 0), `--bayer grbg|rggb|bggr|gbrg`, `--alt N` (usb bandwidth
 reservation), `--frames N`, `--seconds S`, `-v`, `--dump-packets N`,
 `--reg HEX=HEX` / `--i2c HEX=HEX` (override a bridge / sensor register value
 the driver writes, for experiments),
@@ -106,6 +125,10 @@ commented where it lives. "why" is unknown for all of them.
 - vf0250 at 320x240: with the kernel table as is, green comes out swapped with
   red and blue. sensor register 0x17 = 0xe9 instead of 0xe8 fixes it (checked
   on colour bars). `--i2c 17=e8` brings the old behaviour back.
+- vf0250 indoors: the kernel's "no flicker" setting is for outdoors and caps
+  the exposure so low that a dim room came out near black (level 9 of 255).
+  with 50 or 60 the same scene reached about 100, so 60 is the default here.
+  `--freq 0` for outdoors, `--freq 50` where the mains is 50 hz.
 - quickcam express: the sensor's own auto exposure sat near white for every
   target tried, so the driver runs its own from the frame brightness. the lego
   camera reuses it.

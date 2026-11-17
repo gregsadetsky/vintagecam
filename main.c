@@ -1044,7 +1044,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-	struct cam cam = { .width = 0, .light_freq = 0, .exposure = -1, .gain = -1 };
+	struct cam cam = { .width = 0, .light_freq = -1, .exposure = -1, .gain = -1 };
 	enum bayer bayer_override = BAYER_NONE;
 	struct cam *c = &cam;
 	const char *rec_dir = NULL, *export_path = NULL;

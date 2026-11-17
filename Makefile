@@ -5,6 +5,10 @@ LDLIBS += $(shell pkg-config --libs libusb-1.0 libturbojpeg)
 vintagecam: main.c export.c zc3xx.c stv06xx.c xirlink-cit.c ov519.c cam.h gspca/jpeg.h gspca/zc3xx-reg.h gspca/zc3xx-gc0303.h gspca/zc3xx-pas106b.h
 	$(CC) $(CFLAGS) -o $@ main.c export.c zc3xx.c stv06xx.c xirlink-cit.c ov519.c $(LDLIBS) -lpthread
 
+# every camera being recorded into a folder as a local http mjpeg stream (obs)
+vintageserve: serve.c
+	$(CC) $(CFLAGS) -o $@ serve.c -lpthread
+
 # one window with the latest frame of every recording growing in a folder
 vintagegrid: grid.c
 	$(CC) $(CFLAGS) -o $@ grid.c $(shell pkg-config --libs libturbojpeg)
@@ -13,8 +17,12 @@ grid: vintagegrid
 	./vintagegrid recordings $(ARGS)
 
 # record every connected camera and show them all in one window
-wall: vintagecam vintagegrid
+wall: vintagecam vintagegrid vintageserve
 	./wall.sh recordings
+
+# record every connected camera and stream each one for obs, no window
+streams: vintagecam vintageserve
+	./wall.sh --no-grid recordings
 
 # live preview only
 view: vintagecam
@@ -25,6 +33,6 @@ record: vintagecam
 	./vintagecam --record recordings --preview $(ARGS)
 
 clean:
-	rm -f vintagecam vintagegrid
+	rm -f vintagecam vintagegrid vintageserve
 
-.PHONY: view record grid wall clean
+.PHONY: view record grid wall streams clean

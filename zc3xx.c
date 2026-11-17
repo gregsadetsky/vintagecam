@@ -227,6 +227,11 @@ static void setlightfreq(struct cam *c, int scale)
 	struct sd *sd = c->priv;
 	const struct usb_action *t;
 
+	/* not given: the gc0303 gets 60. its "no flicker" table is for outdoors
+	 * and caps the exposure so low that a dim room stays near black
+	 * (measured: level 9 with no flicker, about 100 with 50 or 60). */
+	if (c->light_freq < 0)
+		c->light_freq = sd->pas106 ? 0 : 60;
 	if (sd->pas106) {	/* same tables for both sizes */
 		usb_exchange(c, c->light_freq == 50 ? pas106b_50HZ :
 				c->light_freq == 60 ? pas106b_60HZ :
